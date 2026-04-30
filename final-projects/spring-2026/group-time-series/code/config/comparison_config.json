@@ -1,0 +1,25 @@
+{
+  "comparison_name": "default_model_comparison",
+  "models": [
+    {
+      "model_name": "Harmonic_Regression",
+      "model_type": "harmonic",
+      "label": "HR"
+    },
+    {
+      "model_name": "SARIMA",
+      "model_type": "sarima",
+      "label": "SARIMA"
+    },
+    {
+      "model_name": "BHRQ",
+      "model_type": "bayesian",
+      "label": "BHRQ"
+    },
+    {
+      "model_name": "BDLM",
+      "model_type": "bayesian",
+      "label": "BDLM"
+    }
+  ]
+}

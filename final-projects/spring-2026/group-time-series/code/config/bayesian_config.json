@@ -1,0 +1,16 @@
+{
+  "stan_model": "BHRQ",
+  "data": "default",
+  "seed": 5440,
+  "chains": 4,
+  "cores": 4,
+  "iter": 2000,
+  "warmup": 1000,
+  "refresh": 200,
+  "test_months": 24,
+  "start_date": "2000-01-01",
+  "control": {
+    "adapt_delta": 0.98,
+    "max_treedepth": 13
+  }
+}

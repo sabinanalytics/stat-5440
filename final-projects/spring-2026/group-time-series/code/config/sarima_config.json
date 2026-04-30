@@ -1,0 +1,14 @@
+{
+  "model_name": "SARIMA",
+  "data": "default",
+  "test_months": 24,
+  "start_date": "2000-01-01",
+  "prediction_level": 0.9,
+  "seasonal_period": 12,
+  "max_p": 3,
+  "max_q": 3,
+  "max_P": 3,
+  "max_Q": 3,
+  "max_order": 8,
+  "verbose": true
+}

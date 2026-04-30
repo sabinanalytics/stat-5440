@@ -1,0 +1,7 @@
+{
+  "model_name": "Harmonic_Regression",
+  "data": "default",
+  "test_months": 24,
+  "start_date": "2000-01-01",
+  "prediction_level": 0.9
+}
