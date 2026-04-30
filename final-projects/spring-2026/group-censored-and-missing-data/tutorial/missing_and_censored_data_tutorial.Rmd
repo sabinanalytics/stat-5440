@@ -1,0 +1,1872 @@
+---
+title: "Bayesian Methods for Missing and Censored Data"
+author: "Group 4 — STAT 5440 (Spring 2026)"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    theme: flatly
+    highlight: tango
+    code_folding: show
+    self_contained: true
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo      = TRUE,
+  message   = FALSE,
+  warning   = FALSE,
+  fig.align = "center",
+  fig.width = 7,
+  fig.height = 4.5,
+  cache = TRUE,
+  cache.path = "tutorial_cache/",
+  fig.path = "tutorial_files/figure-html/",
+  out.width = "95%"
+)
+
+library(kableExtra)
+library(mice)
+library(ggplot2)
+library(brms)
+library(survival)
+library(posterior)
+library(bayesplot)
+library(dplyr)
+library(tidyr)
+library(rstan)
+library(NHANES)
+
+options(mc.cores = parallel::detectCores())
+rstan_options(auto_write = TRUE)
+
+# Colors
+col_obs   <- "#4E79A7"   # observed data, marginalization
+col_imp   <- "#F28E2B"   # imputed values, complete-case, naive
+col_true  <- "#000000"   #  reference line
+col_aug   <- "#E15759"   # data augmentation, censored points
+col_marg  <- "#4E79A7"
+col_naive <- "#F28E2B"
+col_miss  <- "#F28E2B"
+col_cens  <- "#E15759"
+
+# Reusable kable styler so every table looks identical
+style_table <- function(tbl) {
+  tbl %>%
+    kable_styling(
+      bootstrap_options = c("striped", "hover", "bordered", "condensed"),
+      full_width        = FALSE,
+      position          = "center",
+      font_size         = 14
+    ) %>%
+    row_spec(0, bold = TRUE, color = "white", background = "#2C3E50")
+}
+```
+
+# Introduction: The Data Collection Mechanism
+
+Before introducing any method, it is worth addressing a foundational question: what exactly are we trying to learn from data?
+
+The objective is almost never to characterize a specific sample. Rather, the aim is to draw inferences about a broader phenomenon — a population, a causal relationship, a biological process. The observed data serve as a window into that underlying reality. In standard analyses, the dataset at hand ($y_{\text{obs}}$) is treated as a representation of the complete data-generating process ($y_{\text{com}}$). This assumption is convenient, and when the sample is representative it is also defensible. When it fails to hold, however, our estimates lose their validity.
+
+As an illustration, consider a survey administered to 1,000 individuals requesting income disclosure, of whom only 700 respond. The sample mean computed from those 700 respondents is an unbiased estimator of mean income *among respondents* — a fundamentally different estimand from mean income in the population, unless respondents and non-respondents are exchangeable. In practice, exchangeability is unlikely: high earners may be reluctant to disclose, while low earners may feel embarrassed to do so. The observed mean is therefore systematically pulled toward the center, and increasing the sample size under the same design does not resolve this bias.
+
+This example reflects a general principle. When the probability of observing a value depends on the value itself, or on variables correlated with it, the observed sample is a biased subset of the complete data. Standard analyses that treat $y_{\text{obs}}$ as equivalent to $y_{\text{com}}$ will therefore yield biased estimates. The direction and magnitude of that bias are governed by the data collection mechanism — the process determining the transition from $y_{\text{com}}$ to $y_{\text{obs}}$. Whether the source of incompleteness is a survey respondent declining to disclose income, a medical sensor malfunctioning at extreme temperatures, or a patient withdrawing from a clinical trial, the fact that a value is absent is itself informative. In such cases, the data-collection process must be modeled alongside the scientific process of interest.
+
+## A Unified Framework for Incomplete Data
+
+Following Gelman et al. (2013, Ch. 8), several apparently distinct problems share the same observed-vs-complete structure:
+
+```{r unified-framework-table, echo=FALSE}
+unified_df <- data.frame(
+  Setting = c("Sampling", "Causal inference", "Rounded data",
+              "Missing data", "Censored data"),
+  `Observed ($y_{\\text{obs}}$)` = c(
+    "$n$ units in the sample",
+    "Outcomes under the assigned treatment",
+    "Discrete or rounded observations",
+    "Recorded values",
+    "Event times or lower bounds"
+  ),
+  `Complete ($y_{\\text{com}}$)` = c(
+    "$N$ units in the population",
+    "Potential outcomes under all treatments",
+    "Precise continuous latent values",
+    "All values (observed + missing)",
+    "Exact event times for all units"
+  ),
+  check.names = FALSE
+)
+
+style_table(
+  kable(unified_df, format = "html", escape = FALSE, align = "lll",
+        caption = "Common incomplete-data settings.")
+) %>%
+  column_spec(1, width = "10em", bold = TRUE) %>%
+  column_spec(2, width = "16em") %>%
+  column_spec(3, width = "16em")
+```
+
+In each case, $y_{\text{obs}}$ is a function of $y_{\text{com}}$ that discards information. To formalize this, we adopt the notation of Gelman et al. (2013, Ch. 8) and introduce an inclusion indicator $I$, where $I_{ij} = 1$ if unit $i$, variable $j$ is observed and $0$ otherwise. The joint distribution of the complete data and the inclusion indicator factorizes as
+
+$$p(y_{\text{com}}, I \mid \theta, \phi) = p(y_{\text{com}} \mid \theta)\, p(I \mid y_{\text{com}}, \phi),$$
+
+where $\theta$ governs the scientific process of interest and $\phi$ governs the missingness mechanism. Since we actually observe the pair $(y_{\text{obs}}, I)$, valid inference requires integrating out the missing component:
+
+$$p(y_{\text{obs}}, I \mid \theta, \phi) = \int p(y_{\text{com}} \mid \theta)\, p(I \mid y_{\text{com}}, \phi)\, dy_{\text{mis}}.$$
+
+The central question is whether the missing mechanism can be ignored. The mechanism may safely be ignored when the probability of observation is independent of the data entirely, or when missingness depends solely on observed quantities. In all other cases, the mechanism must be incorporated explicitly into the model.
+
+The Bayesian approach addresses this by treating the missing information as a latent quantity, assigning it a distribution consistent with the available partial information, and marginalizing over it in the posterior. In effect, we treat the missing data as additional parameters to be estimated.
+
+## Case Analysis
+
+In this tutorial we will study two health questions where careful treatment of incomplete data is necessary.
+
+First we will study a case of systematic missingnes using the NHANES health survey. Here we will want to estimate how total cholesterol associates with systolic blood pressure after adjusting for age and BMI. The complication is that BMI is missing for roughly 8% of respondents, and the missingness rate increases with age. A complete-case analysis that drops those rows would produce estimates valid only for the younger end of the population.
+
+Secondly we will study  censored survival times using the NCCTG lung cancer study. Here we will want to estimate whether sex predicts survival after adjusting for age. The complication is that 28% of patients were still alive when the study ended. Their survival times are not missing in the usual sense — we know each one exceeds a recorded lower bound $c_i$, we just do not know by how much. Treating $c_i$ as an exact event time mistakes a bound for a measurement and produces an incorrect likelihood.
+
+Together, these two examples motivate the methods developed in the rest of the tutorial.
+
+# 1. Missing Data
+
+## Formal Setup
+
+Following the notation introduced above, we decompose the complete data into observed and missing parts:
+
+$$y = (y_{\text{obs}}, y_{\text{mis}}).$$
+
+The objects of interest are the inclusion indicator $I$, the data parameter $\theta$ (the quantity we want to estimate), and the missingness parameter $\phi$ (the parameter governing the missing mechanism). The joint model factors into two pieces:
+
+$$\underbrace{p(y, I \mid \theta, \phi)}_{\text{what we model}} = \underbrace{p(y \mid \theta)}_{\text{data-generating process}} \cdot \underbrace{p(I \mid y, \phi)}_{\text{missingness mechanism}}.$$
+
+
+## Types of Missing Data
+
+The key distinction lies in what the missingness depends on. Three regimes are commonly distinguished, each with different implications for how the missing values must be handled.
+
+```{r missing-types-table, echo=FALSE}
+types_df <- data.frame(
+  Regime = c(
+    "MCAR (Missing Completely at Random)",
+    "MAR (Missing at Random)",
+    "MNAR (Missing Not at Random)"
+  ),
+  `Missingness depends on...` = c(
+    "Nothing (pure randomness)",
+    "Observed data only",
+    "The missing value itself (unobserved)"
+  ),
+  Formula = c(
+    "$P(M \\mid Y_{obs}, Y_{mis}) = P(M)$",
+    "$P(M \\mid Y_{obs}, Y_{mis}) = P(M \\mid Y_{obs})$",
+    "$P(M \\mid Y_{obs}, Y_{mis}) = P(M \\mid Y_{obs}, Y_{mis})$"
+  ),
+  check.names = FALSE
+)
+
+style_table(
+  kable(types_df, format = "html", escape = FALSE, align = "lcc",
+        caption = "Mechanisms of Missing Data")
+) %>%
+  column_spec(1, width = "15em", bold = TRUE, border_right = TRUE) %>%
+  column_spec(2, width = "15em") %>%
+  column_spec(3, width = "20em")
+```
+
+Rubin's (1976) ignorability result connects these regimes to inference: if the mechanism is MAR and $\theta \perp \phi$, then $p(I \mid \cdot)$ drops out of the posterior for $\theta$, and we can model $p(y_{\text{obs}} \mid \theta)$ without explicitly modeling the missingness mechanism. Under MNAR, ignorability fails and the mechanism must be modeled directly.
+
+## Concrete Example: Age and Income Survey
+
+To make these regimes concrete, suppose we conduct a survey collecting $y = (\text{age}, \text{income})$. Age is always recorded, but income is sometimes missing. The reason for the missing income determines which regime we are in.
+
+```{r example-table, echo=FALSE}
+example_df <- data.frame(
+  Regime = c("MCAR", "MAR", "MNAR"),
+  `Why income is missing` = c(
+    "A random 10% of surveys get lost in the mail",
+    "Older respondents skip the money question more often",
+    "High earners refuse to disclose income"
+  ),
+  `What it looks like` = c(
+    "Missing rate flat across all ages and incomes",
+    "Missing rate rises with age (observed)",
+    "Missing rate depends on income itself (unobserved)"
+  ),
+  check.names = FALSE
+)
+
+style_table(
+  kable(example_df, escape = FALSE, align = "ccc",
+        col.names = c("Regime", "Why income is missing", "What it looks like"))
+) %>%
+  column_spec(1, width = "6em", bold = TRUE) %>%
+  column_spec(2, width = "16em") %>%
+  column_spec(3, width = "16em")
+```
+
+MCAR and MAR are called ignorable because we can model $p(y_{\text{obs}} \mid \theta)$ without explicitly modeling the missingness mechanism. MNAR, on the other hand, requires modeling $p(I \mid y_{\text{mis}})$ directly.
+
+## Complete Case Analysis
+
+The most common approach is complete case analysis: drop every row with any `NA` and fit the model as usual. Its behavior depends entirely on the regime. Under MCAR, it is unbiased but wastes partially complete rows and is therefore inefficient. Under MAR, the situation is more nuanced and depends on what variables are in the model. Under MNAR, it is biased, because the complete-case sample is selected on the outcome itself.
+
+The MAR case deserves a closer look. Complete case analysis is unbiased for regression coefficients under MAR if the variable driving missingness is included in the model. In our income example, missingness depends on age and the model is `income ~ age`, so conditioning on age controls for the selection mechanism and complete-case yields unbiased slope estimates. It fails under MAR when the selection variable is absent from the analysis model, when estimating marginal quantities such as `mean(income)`, or when missingness spans many variables.
+
+So why use multiple imputation? Multiple imputation uses all the data, giving narrower credible intervals; it works even when the selection variable is absent from the analysis model; it handles complex patterns across many variables; and it gives valid estimates for marginal quantities such as population means.
+
+## Solutions
+
+Two strategies dominate Bayesian practice. Multiple imputation creates several complete versions of the dataset, each with different plausible values for the missing entries, by (1) building an imputation model $p(y_{\text{mis}} \mid y_{\text{obs}})$, (2) drawing $K$ completed datasets $y^{(1)}, \ldots, y^{(K)}$, (3) fitting the analysis model separately to each, and (4) pooling the $K$ posteriors via Rubin's rules.
+
+Data augmentation in Stan instead treats missing values as parameters sampled jointly with the model parameters in a single MCMC run: declare `y_mis` in `parameters`, reassemble the full `y` in `transformed parameters`, and write both the imputation model and the analysis model in `model`. This is preferred when a single coherent joint posterior is needed or when the analysis is already in Stan.
+
+### How `mice` Works: Chained Equations
+
+The `mice` package implements Fully Conditional Specification (FCS). Rather than specifying a full joint distribution, FCS builds the imputation model from a series of conditional distributions. For each incomplete variable $Y_j$, one specifies a conditional model $p(Y_j \mid Y_{-j})$. Missing cells are initialized with simple fills, and the algorithm cycles through variables, drawing $Y_j \mid Y_{-j}$ for every incomplete $j$ and iterating to convergence. Finally, $K$ completed datasets are saved, spaced along the chain.
+
+The strength of FCS is that it handles mixed variable types and that each conditional is small. Its main caveat is that the collection of conditionals may not correspond to a valid joint distribution — the so-called compatibility problem — though this is rarely a serious issue in practice.
+
+A more important practical concern is congeniality (Meng, 1994): the imputation model must be at least as rich as the analysis model. If the analysis model contains an interaction $X_1 \times X_2$ but the imputation model for $X_1 \mid X_2$ is purely linear, the imputations smooth out the interaction and the analysis cannot recover it. When in doubt, include more variables in the imputation model.
+
+## Applied Example: Simulated MAR Data
+
+### Generate Data
+
+We simulate a dataset where income depends linearly on age with true relationship $\text{income} = 20 + 0.8 \times \text{age} + \epsilon$. MAR missingness is introduced so that older respondents are more likely to skip the income question, but conditional on age the missingness does not depend on income itself.
+
+```{r generate-data}
+set.seed(123)
+
+n      <- 500
+age    <- round(runif(n, 25, 65))
+income <- 20 + 0.8 * age + rnorm(n, 0, 10)
+
+# MAR: missingness probability rises with age but not with income
+income_observed <- income
+income_observed[runif(n) < plogis(-4 + 0.08 * age)] <- NA
+
+dat <- data.frame(age = age, income = income_observed)
+
+n_missing <- sum(is.na(dat$income))
+cat(sprintf("Missing: %d of %d observations (%.1f%%)\n",
+            n_missing, n, 100 * n_missing / n))
+```
+
+### Examining the Missingness Pattern
+
+A first diagnostic is to look at the missingness pattern itself. If we cannot describe how the data became incomplete, we cannot reason about which method will recover the truth.
+
+```{r visualize-missingness, fig.cap="Missingness pattern: older respondents are more likely to have missing income (MAR)."}
+dat$missing <- ifelse(is.na(dat$income), "Missing", "Observed")
+
+ggplot(dat, aes(x = age, fill = missing)) +
+  geom_histogram(binwidth = 5, position = "stack", color = "white") +
+  scale_fill_manual(values = c("Missing" = col_miss, "Observed" = col_obs)) +
+  labs(title    = "Distribution of Age by Missingness Status",
+       subtitle = "Under MAR, older respondents are more likely to have missing income",
+       x = "Age", y = "Count", fill = "") +
+  theme_minimal() +
+  theme(legend.position = "top")
+```
+
+```{r missingness-rate, fig.cap="Probability of missing income increases with age."}
+dat$age_group <- cut(dat$age, breaks = seq(25, 65, by = 10), include.lowest = TRUE)
+miss_rate <- aggregate(missing ~ age_group, data = dat,
+                       FUN = function(x) mean(x == "Missing"))
+
+ggplot(miss_rate, aes(x = age_group, y = missing)) +
+  geom_col(fill = col_miss, alpha = 0.8) +
+  geom_text(aes(label = sprintf("%.0f%%", 100 * missing)), vjust = -0.5) +
+  scale_y_continuous(labels = scales::percent, limits = c(0, 1)) +
+  labs(title = "Missingness Rate by Age Group",
+       x = "Age Group", y = "Proportion Missing") +
+  theme_minimal()
+```
+
+As expected, the missingness rate increases substantially with age, confirming the MAR pattern we simulated.
+
+### Running Multiple Imputation
+
+```{r run-mice}
+# Predictive mean matching is the default for continuous variables
+imp <- mice(dat[, c("age", "income")], m = 5, printFlag = FALSE)
+imp$method
+```
+
+Since `age` has no missing values, no imputation is needed for it. For `income`, `mice` uses predictive mean matching (`pmm`) by default.
+
+### Visualizing Imputed vs. Observed Values
+
+A key diagnostic is whether the imputed values are plausible. We compare their distribution to that of observed values across all five imputations.
+
+```{r plot-imputations, fig.cap="Imputed values (orange) should follow a similar distribution to observed values (blue)."}
+missing_idx <- is.na(dat$income)
+
+plot_data <- data.frame(
+  income     = dat$income[!missing_idx],
+  imputation = "Original\n(Observed)",
+  type       = "Observed"
+)
+
+# Stack the K=5 completed datasets, tagging imputed vs observed rows
+for (m in 1:5) {
+  completed <- complete(imp, m)
+  plot_data <- rbind(plot_data,
+    data.frame(income = completed$income[!missing_idx],
+               imputation = paste0("Imputation ", m), type = "Observed"),
+    data.frame(income = completed$income[missing_idx],
+               imputation = paste0("Imputation ", m), type = "Imputed")
+  )
+}
+
+ggplot(plot_data, aes(x = imputation, y = income, color = type)) +
+  geom_jitter(width = 0.2, alpha = 0.5, size = 1.5) +
+  scale_color_manual(values = c("Imputed" = col_imp, "Observed" = col_obs)) +
+  labs(title    = "Imputed vs. Observed Income Distributions",
+       subtitle = "Each imputation draws different plausible values for missing data",
+       x = "", y = "Income", color = "") +
+  theme_minimal() +
+  theme(legend.position = "top",
+        axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+The imputed values span the same range as the observed values, suggesting that the imputation model is reasonable.
+
+### Fitting a Bayesian Model with `brms`
+
+We now fit a Bayesian linear regression of income on age under two approaches: multiple imputation using `brm_multiple()`, and complete case analysis using only observations with no missing values.
+
+```{r fit-brms-mi, results='hide', cache=TRUE}
+# brm_multiple fits the model once per imputed dataset and pools the draws
+fit_mi <- brm_multiple(
+  income ~ age,
+  data   = imp,
+  family = gaussian(),
+  prior  = c(
+    prior(normal(0, 50),    class = Intercept),
+    prior(normal(0, 5),     class = b),
+    prior(exponential(0.1), class = sigma)
+  ),
+  chains = 4, iter = 2000, warmup = 1000, seed = 123, silent = 2, refresh = 0
+)
+```
+
+```{r mi-summary}
+summary(fit_mi)
+```
+
+```{r fit-brms-cc, results='hide', cache=TRUE}
+dat_cc <- dat[complete.cases(dat), ]
+cat(sprintf("Complete cases: %d of %d (%.1f%% of data used)\n",
+            nrow(dat_cc), nrow(dat), 100 * nrow(dat_cc) / nrow(dat)))
+
+fit_cc <- brm(
+  income ~ age,
+  data   = dat_cc,
+  family = gaussian(),
+  prior  = c(
+    prior(normal(0, 50),    class = Intercept),
+    prior(normal(0, 5),     class = b),
+    prior(exponential(0.1), class = sigma)
+  ),
+  chains = 4, iter = 2000, warmup = 1000, seed = 123, silent = 2, refresh = 0
+)
+```
+
+```{r cc-summary}
+summary(fit_cc)
+```
+
+### Comparing the Two Approaches
+
+```{r extract-coefs}
+pooled_coef  <- fixef(fit_mi)
+intercept_mi <- pooled_coef["Intercept", "Estimate"]
+slope_mi     <- pooled_coef["age", "Estimate"]
+
+cc_coef      <- fixef(fit_cc)
+intercept_cc <- cc_coef["Intercept", "Estimate"]
+slope_cc     <- cc_coef["age", "Estimate"]
+
+true_intercept <- 20
+true_slope     <- 0.8
+```
+
+```{r comparison-table, echo=FALSE}
+comparison <- data.frame(
+  Method = c("True Value", "Multiple Imputation", "Complete Cases"),
+  Intercept = c(sprintf("%.2f", true_intercept),
+                sprintf("%.2f", intercept_mi),
+                sprintf("%.2f", intercept_cc)),
+  `Intercept 95% CI` = c("—",
+    sprintf("(%.2f, %.2f)", pooled_coef["Intercept", "Q2.5"], pooled_coef["Intercept", "Q97.5"]),
+    sprintf("(%.2f, %.2f)", cc_coef["Intercept", "Q2.5"], cc_coef["Intercept", "Q97.5"])),
+  Slope = c(sprintf("%.2f", true_slope),
+            sprintf("%.2f", slope_mi),
+            sprintf("%.2f", slope_cc)),
+  `Slope 95% CI` = c("—",
+    sprintf("(%.2f, %.2f)", pooled_coef["age", "Q2.5"], pooled_coef["age", "Q97.5"]),
+    sprintf("(%.2f, %.2f)", cc_coef["age", "Q2.5"], cc_coef["age", "Q97.5"])),
+  check.names = FALSE
+)
+
+style_table(
+  kable(comparison, escape = FALSE, align = "ccccc",
+        col.names = c("Method", "Intercept", "Intercept 95% CI", "Slope", "Slope 95% CI"))
+) %>%
+  column_spec(1, bold = TRUE, width = "10em") %>%
+  column_spec(2:5, width = "8em") %>%
+  row_spec(1, background = "#f0f0f0")
+```
+
+Both methods give estimates close to the true values, which is expected: because missingness depends on `age` and `age` is in the model, complete case analysis is also unbiased here. The key advantage of multiple imputation is therefore efficiency — it should produce narrower credible intervals by using all 500 observations rather than discarding those with missing income.
+
+```{r efficiency}
+ci_width_mi <- pooled_coef["age", "Q97.5"] - pooled_coef["age", "Q2.5"]
+ci_width_cc <- cc_coef["age", "Q97.5"] - cc_coef["age", "Q2.5"]
+
+cat(sprintf("95%% CI width for slope:\n  MI: %.4f\n  CC: %.4f\n  Efficiency gain: %.1f%%\n",
+            ci_width_mi, ci_width_cc, 100 * (1 - ci_width_mi / ci_width_cc)))
+```
+
+```{r comparison-plot, fig.width=10, fig.height=6, fig.cap="Multiple imputation (blue) vs. complete case analysis (orange). Under MAR, both are unbiased, but MI has narrower credible intervals."}
+posterior_mi <- as_draws_df(fit_mi)
+posterior_cc <- as_draws_df(fit_cc)
+
+age_seq <- seq(25, 65, length.out = 100)
+
+# Posterior predictive band on the regression line for each method
+mi_fitted <- sapply(age_seq, function(a) posterior_mi$b_Intercept + posterior_mi$b_age * a)
+mi_ci <- data.frame(age   = age_seq,
+                    mean  = intercept_mi + slope_mi * age_seq,
+                    lower = apply(mi_fitted, 2, quantile, 0.025),
+                    upper = apply(mi_fitted, 2, quantile, 0.975),
+                    model = "Multiple Imputation")
+
+cc_fitted <- sapply(age_seq, function(a) posterior_cc$b_Intercept + posterior_cc$b_age * a)
+cc_ci <- data.frame(age   = age_seq,
+                    mean  = intercept_cc + slope_cc * age_seq,
+                    lower = apply(cc_fitted, 2, quantile, 0.025),
+                    upper = apply(cc_fitted, 2, quantile, 0.975),
+                    model = "Complete Cases")
+
+ci_data  <- rbind(mi_ci, cc_ci)
+obs_data <- dat[!is.na(dat$income), ]
+
+ggplot() +
+  geom_point(data = obs_data, aes(x = age, y = income), color = "grey60", alpha = 0.4) +
+  geom_ribbon(data = ci_data, aes(x = age, ymin = lower, ymax = upper, fill = model), alpha = 0.3) +
+  geom_line(data = ci_data, aes(x = age, y = mean, color = model), linewidth = 1.2) +
+  geom_abline(intercept = 20, slope = 0.8, linetype = "dashed", linewidth = 1.2, color = col_true) +
+  scale_color_manual(values = c("Complete Cases" = col_imp, "Multiple Imputation" = col_obs)) +
+  scale_fill_manual(values  = c("Complete Cases" = col_imp, "Multiple Imputation" = col_obs)) +
+  labs(title    = "Multiple Imputation vs. Complete Case Analysis",
+       subtitle = "Shaded regions: 95% CI | Dashed black: true regression line",
+       x = "Age", y = "Income", color = "Model", fill = "Model") +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+```
+
+Both methods recover estimates close to the true line. The multiple-imputation band is narrower, reflecting the efficiency gain from using all 500 observations.
+
+## When Both Methods Fail: MNAR
+
+Under MNAR, the probability of observing a value depends on what that value would have been. The observed data therefore constitute a biased sample of the complete data, and no amount of imputation from observed values can recover what is systematically missing.
+
+### Simulating MNAR Data
+
+To make this concrete, we create a scenario where high-income respondents are less likely to report their income. Missingness now depends on income itself rather than on age.
+
+```{r generate-mnar}
+set.seed(456)
+
+n_mnar           <- 500
+age_mnar         <- round(runif(n_mnar, 25, 65))
+income_mnar_full <- 20 + 0.8 * age_mnar + rnorm(n_mnar, 0, 10)
+
+# MNAR: missingness probability rises with income itself
+income_mnar <- income_mnar_full
+miss_prob   <- plogis(-3 + 0.05 * income_mnar_full)
+income_mnar[runif(n_mnar) < miss_prob] <- NA
+
+dat_mnar <- data.frame(age = age_mnar, income = income_mnar)
+
+cat(sprintf("MNAR Missing: %d of %d (%.1f%%)\n",
+            sum(is.na(income_mnar)), n_mnar, 100 * mean(is.na(income_mnar))))
+cat(sprintf("Mean income (full data):     %.2f\n", mean(income_mnar_full)))
+cat(sprintf("Mean income (observed only): %.2f\n", mean(income_mnar, na.rm = TRUE)))
+```
+
+The observed mean is lower than the true mean — the signature of MNAR. Because high earners hide their income, the observed sample is systematically biased toward lower values.
+
+```{r fit-mnar-mi, results='hide', cache=TRUE}
+imp_mnar <- mice(dat_mnar, m = 5, printFlag = FALSE)
+
+fit_mnar_mi <- brm_multiple(
+  income ~ age,
+  data   = imp_mnar,
+  family = gaussian(),
+  prior  = c(
+    prior(normal(0, 50),    class = Intercept),
+    prior(normal(0, 5),     class = b),
+    prior(exponential(0.1), class = sigma)
+  ),
+  chains = 4, iter = 2000, warmup = 1000, seed = 456, silent = 2, refresh = 0
+)
+```
+
+```{r fit-mnar-cc, results='hide', cache=TRUE}
+dat_mnar_cc <- dat_mnar[complete.cases(dat_mnar), ]
+
+fit_mnar_cc <- brm(
+  income ~ age,
+  data   = dat_mnar_cc,
+  family = gaussian(),
+  prior  = c(
+    prior(normal(0, 50),    class = Intercept),
+    prior(normal(0, 5),     class = b),
+    prior(exponential(0.1), class = sigma)
+  ),
+  chains = 4, iter = 2000, warmup = 1000, seed = 456, silent = 2, refresh = 0
+)
+```
+
+```{r mnar-results}
+mnar_mi_coef <- fixef(fit_mnar_mi)
+mnar_cc_coef <- fixef(fit_mnar_cc)
+
+mi_intercept_bias <- mnar_mi_coef["Intercept", "Estimate"] - 20
+mi_slope_bias     <- mnar_mi_coef["age", "Estimate"] - 0.8
+cc_intercept_bias <- mnar_cc_coef["Intercept", "Estimate"] - 20
+cc_slope_bias     <- mnar_cc_coef["age", "Estimate"] - 0.8
+```
+
+```{r mnar-table, echo=FALSE}
+mnar_comparison <- data.frame(
+  Method = c("True Value", "Multiple Imputation", "Complete Cases"),
+  Intercept = c("20.00",
+                sprintf("%.2f", mnar_mi_coef["Intercept", "Estimate"]),
+                sprintf("%.2f", mnar_cc_coef["Intercept", "Estimate"])),
+  `Intercept Bias` = c("—",
+                      sprintf("%.2f", mi_intercept_bias),
+                      sprintf("%.2f", cc_intercept_bias)),
+  Slope = c("0.80",
+            sprintf("%.2f", mnar_mi_coef["age", "Estimate"]),
+            sprintf("%.2f", mnar_cc_coef["age", "Estimate"])),
+  `Slope Bias` = c("—",
+                   sprintf("%.3f", mi_slope_bias),
+                   sprintf("%.3f", cc_slope_bias)),
+  check.names = FALSE
+)
+
+style_table(
+  kable(mnar_comparison, escape = FALSE, align = "ccccc",
+        col.names = c("Method", "Intercept", "Intercept Bias", "Slope", "Slope Bias"))
+) %>%
+  column_spec(1, bold = TRUE, width = "10em") %>%
+  column_spec(2:5, width = "7em") %>%
+  row_spec(1, background = "#f0f0f0")
+```
+
+Both methods now show bias, particularly in the intercept, because we systematically miss high-income observations at every age level.
+
+```{r mnar-plot, fig.width=10, fig.height=6, fig.cap="Under MNAR, both methods are biased. Red crosses show where the missing high-income observations would have been."}
+missing_idx_mnar  <- is.na(dat_mnar$income)
+obs_data_mnar     <- dat_mnar[!missing_idx_mnar, ]
+posterior_mnar_mi <- as_draws_df(fit_mnar_mi)
+posterior_mnar_cc <- as_draws_df(fit_mnar_cc)
+
+mnar_mi_fitted <- sapply(age_seq, function(a) posterior_mnar_mi$b_Intercept + posterior_mnar_mi$b_age * a)
+mnar_mi_ci <- data.frame(age = age_seq,
+  mean  = mnar_mi_coef["Intercept", "Estimate"] + mnar_mi_coef["age", "Estimate"] * age_seq,
+  lower = apply(mnar_mi_fitted, 2, quantile, 0.025),
+  upper = apply(mnar_mi_fitted, 2, quantile, 0.975),
+  model = "Multiple Imputation")
+
+mnar_cc_fitted <- sapply(age_seq, function(a) posterior_mnar_cc$b_Intercept + posterior_mnar_cc$b_age * a)
+mnar_cc_ci <- data.frame(age = age_seq,
+  mean  = mnar_cc_coef["Intercept", "Estimate"] + mnar_cc_coef["age", "Estimate"] * age_seq,
+  lower = apply(mnar_cc_fitted, 2, quantile, 0.025),
+  upper = apply(mnar_cc_fitted, 2, quantile, 0.975),
+  model = "Complete Cases")
+
+mnar_ci_data <- rbind(mnar_mi_ci, mnar_cc_ci)
+
+ggplot() +
+  geom_point(data = obs_data_mnar, aes(x = age, y = income), color = "grey70", alpha = 0.5) +
+  # Red crosses mark the missing high-income observations (unobserved truth)
+  geom_point(data = data.frame(age    = age_mnar[missing_idx_mnar],
+                               income = income_mnar_full[missing_idx_mnar]),
+             aes(x = age, y = income), color = col_cens, alpha = 0.4, shape = 4, size = 2) +
+  geom_ribbon(data = mnar_ci_data,
+              aes(x = age, ymin = lower, ymax = upper, fill = model), alpha = 0.3) +
+  geom_line(data = mnar_ci_data, aes(x = age, y = mean, color = model), linewidth = 1.2) +
+  geom_abline(intercept = 20, slope = 0.8, linetype = "dashed", linewidth = 1.2, color = col_true) +
+  scale_color_manual(values = c("Complete Cases" = col_imp, "Multiple Imputation" = col_obs)) +
+  scale_fill_manual(values  = c("Complete Cases" = col_imp, "Multiple Imputation" = col_obs)) +
+  labs(title    = "MNAR: Both Methods Fail When Missingness Depends on Income",
+       subtitle = "Red crosses: missing high-income observations | Dashed black: true regression line",
+       x = "Age", y = "Income", color = "Model", fill = "Model") +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+```
+
+The red crosses reveal the problem: at every age level, the missing values are systematically higher than the observed ones. Both fitted lines are pulled downward away from the true regression line. Standard approaches such as multiple imputation and complete-case analysis cannot fix MNAR because they assume an ignorable missingness mechanism. Addressing MNAR therefore requires explicitly modeling the missingness mechanism via selection models or pattern-mixture models, conducting sensitivity analyses that vary MNAR assumptions, or incorporating external information about why values are missing.
+
+## Summary: When Does Each Method Work?
+
+```{r summary-table, echo=FALSE}
+summary_df <- data.frame(
+  Scenario = c("MCAR",
+               "MAR (selection var in model)",
+               "MAR (selection var NOT in model)",
+               "MNAR"),
+  `Complete Cases`      = c("Unbiased, inefficient",
+                            "Unbiased, inefficient",
+                            "Biased",
+                            "Biased"),
+  `Multiple Imputation` = c("Unbiased, efficient",
+                            "Unbiased, efficient",
+                            "Unbiased, efficient",
+                            "Biased (assumes MAR)"),
+  check.names = FALSE
+)
+
+style_table(
+  kable(summary_df, escape = FALSE, align = "ccc",
+        col.names = c("Scenario", "Complete Cases", "Multiple Imputation"))
+) %>%
+  column_spec(1, bold = TRUE, width = "14em") %>%
+  column_spec(2:3, width = "10em")
+```
+
+In practical terms, multiple imputation is never worse than complete case analysis: at worst, both are equally unbiased and MI is more efficient. Under MAR, when the selection mechanism is not controlled for in the analysis model, MI can eliminate bias that complete-case cannot. Under MNAR, neither simple approach works.
+
+
+
+## Applied Example 2: NHANES
+
+In the previous section, we saw that **Missing At Random (MAR)** data can be handled well using multiple imputation or data augmentation. But what happens when the missingness depends on the *unobserved value itself*? This is **Missing Not At Random (MNAR)**, and it requires a fundamentally different approach.
+
+In this section, we are going to see  other complications that arise when handling real data:
+  
+1. The difference between **selection models** and **pattern-mixture models** for MNAR
+2. **Bayesian data augmentation** using `brms` with the `mi()` syntax
+3. **Sensitivity analysis** across different missingness assumptions
+4. How to assess whether conclusions are **robust** to MNAR departures
+
+
+### MNAR Models: Two Frameworks
+  
+Under MNAR, the missingness mechanism depends on $y_{\text{mis}}$ and **cannot be ignored**. There are two main frameworks for modeling MNAR data.
+
+#### Selection Models
+
+**Factorization:** $p(y, I) = p(y \mid \theta) \cdot p(I \mid y, \phi)$
+  
+  In a selection model, we:
+  1. Specify a model for the complete data $p(y \mid \theta)$
+  2. Specify a model for the probability of being observed $p(I \mid y, \phi)$
+  
+  The missingness model explicitly depends on the (potentially unobserved) value of $y$.
+
+**Example:** In a survey, the probability of reporting income depends on income itself:
+  $$P(\text{report income}) = \text{logit}^{-1}(\alpha + \beta \cdot \text{income})$$
+  
+#### Pattern-Mixture Models
+  
+**Factorization:** $p(y, I) = p(y \mid I, \theta_I) \cdot p(I \mid \phi)$
+  
+In a pattern-mixture model, we:
+1. Specify **separate outcome distributions** for each missingness pattern
+2. Think of completers and non-completers as coming from different populations
+
+**Example:** In a clinical trial, patients who drop out (missing) may have systematically different outcomes than completers. We model:
+  - $y \mid \text{completer} \sim N(\mu_1, \sigma^2)$
+  - $y \mid \text{dropout} \sim N(\mu_2, \sigma^2)$
+  
+This is natural for dropout scenarios: we explicitly parameterize the difference between populations.
+
+  
+#### The Fundamental Problem with MNAR
+  
+```{r mnar-warning, echo=FALSE}
+warning_df <- data.frame(
+  Issue = c("**Untestable**", "**Requires assumptions**", "**Sensitivity analysis**"),
+  Explanation = c(
+    "We cannot verify MNAR from observed data alone",
+    "Results depend heavily on the assumed MNAR mechanism",
+    "The standard approach is to fit under multiple assumptions and report the range of results"
+  )
+)
+
+kable(warning_df, escape = FALSE, col.names = c("Issue", "Explanation")) %>%
+  kable_styling(bootstrap_options = c("striped", "bordered"),
+                full_width = FALSE, position = "center") %>%
+  column_spec(1, bold = TRUE, width = "10em") %>%
+  column_spec(2, width = "30em")
+```
+  
+### The Data
+ Here We will use data from the **US National Health and Nutrition Examination Survey (2009-2012)**, available via the `NHANES` R package. After filtering to adults (age ≥ 18), we have approximately 7,150 observations.
+
+**Research question:** How does total cholesterol associate with systolic blood pressure, adjusting for age and BMI?
+  
+**Variables:**
+  
+```{r vars-table, echo=FALSE}
+vars_df <- data.frame(
+  Variable = c("`BPSysAve`", "`Age`", "`BMI`", "`TotChol`", "`Weight`, `Gender`"),
+  Description = c(
+    "Average systolic blood pressure (mmHg) — **outcome**",
+    "Age in years — fully observed",
+    "Body mass index — fully observed",
+    "Total cholesterol (mmol/L) — **missing for ~5%**",
+    "Auxiliary predictors for imputation model"
+  )
+)
+
+kable(vars_df, escape = FALSE, col.names = c("Variable", "Description")) %>%
+  kable_styling(bootstrap_options = c("striped", "bordered"),
+                full_width = FALSE, position = "center") %>%
+  column_spec(1, bold = TRUE, width = "10em", extra_css = "font-family: monospace;") %>%
+  column_spec(2, width = "28em")
+```
+
+**Why is TotChol missing?** NHANES assigns participants to a fasting subsample for lab measurements. Whether someone is assigned depends on logistical factors (survey design), not on their cholesterol level. This makes **MAR** (conditional on observed covariates) a defensible assumption—but we'll test sensitivity to MNAR.
+
+
+#### Data Preparation
+
+```{r load-data2}
+## Filter to adults with complete covariates
+nhanes_dat <- NHANES %>%
+  filter(Age >= 18) %>%
+  select(BPSysAve, Age, BMI, Weight, Gender, TotChol) %>%
+  drop_na(BPSysAve, Age, BMI, Weight, Gender) %>%
+  mutate(
+    ## Standardize all continuous predictors (mean=0, sd=1)
+    Age_z = scale(Age)[,1],
+    Age_zsq = Age_z^2,  ## Quadratic term for non-linearity
+    BMI_z = scale(BMI)[,1],
+    Weight_z = scale(Weight)[,1],
+    age_quartile = ntile(Age, 4)
+  )
+```
+
+Let's examine the extent of missingness:
+  
+```{r examine-missing2}
+cat(sprintf("Total adult observations: %d\n", nrow(nhanes_dat)))
+cat(sprintf("Missing TotChol: %d (%.1f%%)\n",
+            sum(is.na(nhanes_dat$TotChol)),
+            100 * mean(is.na(nhanes_dat$TotChol))))
+```
+
+With only ~5% missing, complete case analysis might seem reasonable. However, we want to:
+  1. Use all available data (efficiency)
+2. Understand sensitivity to the MAR assumption
+3. Demonstrate the Bayesian data augmentation approach
+
+  
+#### Visualizing the Data
+  
+Before modeling, lets examine the distributions of our key variables.
+
+```{r viz-data2, fig.height=4}
+## Blood pressure distribution
+ggplot(nhanes_dat, aes(x = BPSysAve)) +
+  geom_histogram(binwidth = 5, fill = col_aug , color = "white", alpha = 0.7) +
+  labs(title = "Distribution of Systolic Blood Pressure",
+       x = "Average Systolic BP (mmHg)", y = "Count") +
+  theme_minimal()
+```
+
+```{r viz-chol2, fig.height=4}
+## Cholesterol distribution (observed only)
+ggplot(nhanes_dat, aes(x = TotChol)) +
+  geom_histogram(binwidth = 0.2, fill = col_obs, color = "white", alpha = 0.7) +
+  labs(title = "Distribution of Total Cholesterol (Observed Values)",
+       subtitle = sprintf("Mean: %.2f mmol/L, SD: %.2f mmol/L",
+                          mean(nhanes_dat$TotChol, na.rm = TRUE),
+                          sd(nhanes_dat$TotChol, na.rm = TRUE)),
+       x = "Total Cholesterol (mmol/L)", y = "Count") +
+  theme_minimal()
+```
+
+### Bayesian Data Augmentation with `brms`
+
+#### Model Specification
+
+We use `brms` with the `mi()` syntax to perform **Bayesian data augmentation**. This treats the missing TotChol values as parameters and samples them jointly with the regression coefficients in a single MCMC run.
+
+**Outcome model** (blood pressure):
+$$\text{BPSysAve}_i = \alpha + \beta_{\text{age}} \text{Age}^*_i + \beta_{\text{age}^2} (\text{Age}^*_i)^2 + \beta_{\text{BMI}} \text{BMI}^*_i + \beta_{\text{TC}} \text{TotChol}_i + \varepsilon_i, \quad \varepsilon_i \sim N(0, \sigma^2)$$
+
+where $^*$ denotes standardized variables (mean 0, SD 1). We **standardize continuous predictors** to ensure stable prior specification—this prevents numerical issues when predictors are on very different scales. We include a **quadratic age term** because the relationship between age and blood pressure is often non-linear—BP tends to rise more steeply at older ages.
+
+**Imputation model** (cholesterol):
+$$\text{TotChol}_i = \gamma_0 + \gamma_{\text{age}} \text{Age}^*_i + \gamma_{\text{BMI}} \text{BMI}^*_i + \gamma_{\text{wt}} \text{Weight}^*_i + \gamma_{\text{gen}} \text{Gender}_i + \eta_i, \quad \eta_i \sim N(0, \sigma_{\text{TC}}^2)$$
+
+The imputation model uses additional predictors (Weight, Gender) that aren't in the outcome model—this is the **congeniality principle** in action: the imputation model should be at least as rich as the analysis model.
+
+```{r model-formula}
+## brms formula with mi() for missing predictor
+## Use standardized predictors for stable prior specification
+## Include quadratic age term for non-linear age-BP relationship
+bform <- bf(BPSysAve ~ Age_z + Age_zsq + BMI_z + mi(TotChol)) +
+  bf(TotChol | mi() ~ Age_z + BMI_z + Weight_z + Gender) +
+  set_rescor(FALSE)
+```
+  
+#### Prior Specification
+  
+We choose **informative priors** based on domain knowledge. Tighter priors produce a more meaningful prior predictive check and can improve sampling efficiency:
+  
+```{r priors-table, echo=FALSE}
+priors_df <- data.frame(
+  Parameter = c("$\\alpha$ (intercept)", "$\\beta_{\\text{age}}$", "$\\beta_{\\text{age}^2}$",
+                "$\\beta_{\\text{BMI}}$", "$\\beta_{\\text{TC}}$", "$\\sigma$",
+                "$\\gamma_0$ (TC intercept)", "$\\gamma_{\\cdot}$ (TC slopes)", "$\\sigma_{\\text{TC}}$"),
+  Prior = c("$N(120, 10^2)$", "$N(5, 3^2)$", "$N(0, 2^2)$",
+            "$N(3, 2^2)$", "$N(1, 1^2)$", "$N^+(15, 5^2)$",
+            "$N(5, 1^2)$", "$N(0, 0.3^2)$", "$N^+(1, 0.5^2)$"),
+  Rationale = c("Adult SBP typically 110-130 mmHg at mean age",
+                "~5 mmHg per SD of age (SD ~17 years)",
+                "Modest curvature in age-BP relationship",
+                "~3 mmHg per SD of BMI (SD ~7 units)",
+                "1-2 mmHg per mmol/L cholesterol is plausible",
+                "Residual SD ~15 mmHg is typical for BP models",
+                "Adult TotChol mean ~5 mmol/L",
+                "Modest standardized effects on cholesterol",
+                "TotChol SD ~1 mmol/L")
+)
+
+kable(priors_df, escape = FALSE, col.names = c("Parameter", "Prior", "Rationale")) %>%
+  kable_styling(bootstrap_options = c("striped", "bordered"),
+                full_width = FALSE, position = "center") %>%
+  column_spec(1, width = "10em") %>%
+  column_spec(2, width = "8em") %>%
+  column_spec(3, width = "20em")
+```
+
+```{r set-priors2}
+bp_priors <- c(
+  ## Outcome model - priors for standardized predictors
+  ## Coefficients now represent effect of 1 SD change in predictor
+  prior(normal(120, 10), class = "Intercept", resp = "BPSysAve"),
+  prior(normal(5, 3),    class = "b", coef = "Age_z",     resp = "BPSysAve"),
+  prior(normal(0, 2),    class = "b", coef = "Age_zsq",   resp = "BPSysAve"),
+  prior(normal(3, 2),    class = "b", coef = "BMI_z",     resp = "BPSysAve"),
+  prior(normal(1, 1),    class = "b", coef = "miTotChol", resp = "BPSysAve"),
+  prior(normal(15, 5),   class = "sigma",                 resp = "BPSysAve"),
+  
+  ## Imputation model (TotChol in mmol/L, predictors standardized)
+  prior(normal(5, 1),    class = "Intercept", resp = "TotChol"),
+  prior(normal(0, 0.3),  class = "b",         resp = "TotChol"),
+  prior(normal(1, 0.5),  class = "sigma",     resp = "TotChol")
+)
+```
+
+
+#### Prior Predictive Check
+  
+Before fitting to data, we check that our priors generate plausible predictions. This ensures we haven't accidentally specified priors that are too narrow or too wide.
+
+ **Note:** Prior predictive checks with `mi()` models can be numerically unstable because the imputation model samples missing values from unbounded prior distributions. We run the prior predictive check on a simplified model (complete cases only) to verify our blood pressure priors are sensible.
+
+```{r prior-predictive2, results='hide', cache=TRUE}
+## Use complete cases for prior predictive check (avoids mi() instability)
+nhanes_cc_prior <- drop_na(nhanes_dat, TotChol)
+
+fit_prior <- brm(
+  formula      = BPSysAve ~ Age_z + Age_zsq + BMI_z + TotChol,
+  data         = nhanes_cc_prior,
+  prior        = c(
+    prior(normal(120, 10), class = "Intercept"),
+    prior(normal(5, 3),    class = "b", coef = "Age_z"),
+    prior(normal(0, 2),    class = "b", coef = "Age_zsq"),
+    prior(normal(3, 2),    class = "b", coef = "BMI_z"),
+    prior(normal(1, 1),    class = "b", coef = "TotChol"),
+    prior(normal(15, 5),   class = "sigma")
+  ),
+  sample_prior = "only",
+  chains       = 2,
+  iter         = 1000,
+  seed         = 5440,
+  refresh      = 0
+)
+```
+
+```{r prior-ppc-plot3, fig.cap="Prior predictive check: the prior predictive distribution (light blue) should overlap with the observed data (dark blue)."}
+pp_check(fit_prior, ndraws = 100) +
+  ggtitle("Prior Predictive Check") +
+  theme_minimal()
+```
+
+With our **informative priors**, the prior predictive draws (light blue) form a distribution centered around plausible blood pressure values rather than spreading uniformly. The observed data distribution (dark blue) should fall within the prior predictive range. If the prior predictive were too narrow and missed the observed data, we would need to widen our priors. If it were too diffuse (flat lines), our priors wouldn't be contributing much information.
+
+  
+### Fitting the MAR Model
+  
+ Now we fit the full model under the MAR assumption. The `mi()` syntax tells `brms` to impute missing TotChol values as part of the MCMC sampling.
+
+```{r fit-mar2, results='hide', cache=TRUE}
+fit_mar <- brm(
+  formula = bform,
+  data    = nhanes_dat,
+  prior   = bp_priors,
+  chains  = 4,
+  iter    = 2000,
+  warmup  = 1000,
+  seed    = 5440,
+  refresh = 0,
+  backend = "rstan",
+  control = list(adapt_delta = 0.95, max_treedepth = 15)
+)
+```
+
+#### MCMC Diagnostics
+  
+Before interpreting results, we must verify that the MCMC sampler has converged.
+
+```{r diagnostics2}
+## Discover actual parameter names from the model
+all_pars <- variables(fit_mar)
+cat("All parameters in model:\n")
+print(all_pars[grepl("^b_|^bsp_|^sigma", all_pars)])
+
+## Key parameters to check - use pattern matching to find them
+key_pars <- all_pars[grepl("^b_BPSysAve_|^bsp_BPSysAve_|^sigma_BPSysAve", all_pars)]
+key_pars <- key_pars[!grepl("Ymi_", key_pars)]  ## Exclude imputed values
+cat("\nKey parameters for diagnostics:\n")
+print(key_pars)
+
+cat("\nR-hat values (should be < 1.01):\n")
+print(round(brms::rhat(fit_mar)[key_pars], 4))
+
+cat("\nEffective sample size ratios (should be > 0.1):\n")
+print(round(brms::neff_ratio(fit_mar)[key_pars], 3))
+```
+
+```{r trace-plots, fig.height=7, fig.cap="Trace plots show good mixing across all four chains."}
+mcmc_trace(fit_mar, pars = key_pars) +
+  ggtitle("MCMC Trace Plots")
+```
+
+All $\hat{R}$ values are close to 1.00, and effective sample sizes are adequate. The trace plots show good mixing with no obvious trends or stuck chains.
+
+#### Posterior Summaries
+  
+```{r results-table2}
+post_sum <- posterior_summary(fit_mar, variable = key_pars)
+
+## Create nice labels for parameters
+param_labels <- gsub("b_BPSysAve_", "", rownames(post_sum))
+param_labels <- gsub("bsp_BPSysAve_", "", param_labels)
+param_labels <- gsub("sigma_BPSysAve", "sigma", param_labels)
+
+results_df <- data.frame(
+  Parameter = param_labels,
+  Mean = sprintf("%.3f", post_sum[, "Estimate"]),
+`95% CrI` = sprintf("(%.3f, %.3f)", post_sum[, "Q2.5"], post_sum[, "Q97.5"]),
+  check.names = FALSE
+)
+
+kable(results_df, escape = FALSE,
+      col.names = c("Parameter", "Posterior Mean", "95% CrI")) %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "bordered"),
+                full_width = FALSE, position = "center") %>%
+  column_spec(1, bold = TRUE, width = "10em") %>%
+  column_spec(2:3, width = "10em")
+```
+
+#### Interpretation
+
+```{r interpret2}
+## Find the TotChol parameter (may be named differently)
+tc_par <- key_pars[grepl("miTotChol|TotChol", key_pars)][1]
+tc_mean <- post_sum[tc_par, "Estimate"]
+tc_sd   <- post_sum[tc_par, "Est.Error"]
+tc_sd_obs <- sd(nhanes_dat$TotChol, na.rm = TRUE)
+
+cat(sprintf("Key finding: Each 1 mmol/L increase in total cholesterol is associated
+with a %.2f mmHg increase in systolic blood pressure (95%% CrI: %.2f to %.2f).
+
+This effect excludes zero by %.1f posterior standard deviations.
+
+Per 1 SD of TotChol (%.2f mmol/L): SBP increases by %.2f mmHg.\n",
+    tc_mean,
+    post_sum[tc_par, "Q2.5"],
+    post_sum[tc_par, "Q97.5"],
+    tc_mean / tc_sd,
+    tc_sd_obs,
+    tc_mean * tc_sd_obs))
+```
+
+#### Posterior Predictive Checks
+
+Does the model adequately capture the distribution of blood pressure?
+
+```{r ppc-density2, fig.cap="Posterior predictive check: model predictions (light blue) vs. observed data (dark blue)."}
+pp_check(fit_mar, resp = "BPSysAve", type = "dens_overlay", ndraws = 50) +
+  ggtitle("Posterior Predictive Check: Density Overlay") +
+  theme_minimal()
+```
+
+The model recovers the bulk of the distribution well. There's slight underdispersion in the upper tail, which is common with linear models for health outcomes that have a long right tail.
+
+```{r ppc-grouped2, fig.height=4, fig.cap="Posterior predictive check by age quartile. The dark line (observed mean) should fall within the bulk of the histogram (posterior predictive means)."}
+y_obs     <- nhanes_dat$BPSysAve
+y_rep_mat <- posterior_predict(fit_mar, resp = "BPSysAve", ndraws = 200)
+
+ppc_stat_grouped(
+  y     = y_obs,
+  yrep  = y_rep_mat,
+  group = nhanes_dat$age_quartile,
+  stat  = "mean"
+) + ggtitle("PPC: Mean SBP by Age Quartile") +
+  theme_minimal()
+```
+
+In each panel, the light blue histogram shows the distribution of mean BP from posterior predictive draws, while the dark vertical line marks the observed mean. Ideally, the observed mean falls near the center of the histogram.
+
+With the **quadratic age term** included in our model, the observed means should fall closer to the center of the posterior predictive distributions. The quadratic term allows the model to capture the non-linear relationship between age and blood pressure—BP tends to rise more steeply at older ages.
+
+
+### Sensitivity Analysis: Is Our Conclusion Robust?
+  
+The key question: **Does the positive association between cholesterol and blood pressure hold under different missingness assumptions?**
+  
+We compare three approaches:
+  
+1. **Complete Case (MCAR):** Drop observations with missing TotChol
+2. **Data Augmentation (MAR):** The model we just fit
+3. **MNAR Tilt:** Assume missing TotChol values are systematically higher than MAR predicts
+
+#### Complete Case Analysis (MCAR)
+
+This implicitly assumes that missingness is completely random—observations with missing TotChol are a random sample of all observations.
+
+```{r fit-cc, results='hide', cache=TRUE}
+nhanes_cc <- drop_na(nhanes_dat, TotChol)
+cat(sprintf("Complete cases: %d of %d (%.1f%% retained)\n",
+            nrow(nhanes_cc), nrow(nhanes_dat),
+            100 * nrow(nhanes_cc) / nrow(nhanes_dat)))
+
+fit_cc <- brm(
+  formula = BPSysAve ~ Age_z + Age_zsq + BMI_z + TotChol,
+  data    = nhanes_cc,
+  prior   = c(
+    prior(normal(120, 10), class = "Intercept"),
+    prior(normal(5, 3),    class = "b", coef = "Age_z"),
+    prior(normal(0, 2),    class = "b", coef = "Age_zsq"),
+    prior(normal(3, 2),    class = "b", coef = "BMI_z"),
+    prior(normal(1, 1),    class = "b", coef = "TotChol"),
+    prior(normal(15, 5),   class = "sigma")
+  ),
+  chains = 4, iter = 2000, seed = 5440, refresh = 0,
+  control = list(adapt_delta = 0.95)
+)
+```
+
+#### MNAR Tilt: Delta-Adjustment
+  
+  Under MNAR, we hypothesize that missing TotChol values are systematically different from what the MAR model predicts. One common approach is the **delta-adjustment** or **tilt**:
+  
+  $$\text{TotChol}_{\text{imputed}}^{\text{MNAR}} = \text{TotChol}_{\text{imputed}}^{\text{MAR}} + \delta$$
+  
+  **Rationale for $\delta = +0.5$ mmol/L:** Participants not in the fasting subsample may have eaten recently, leading to elevated post-prandial cholesterol. We posit that, conditional on observed covariates, missing TotChol values are 0.5 mmol/L (~0.5 SD, ~20 mg/dL) higher than the MAR model predicts.
+
+```{r mnar-tilt, results='hide', cache=TRUE}
+delta <- 0.5  ## mmol/L
+
+## Extract posterior mean imputations from MAR model
+draws_mar <- as_draws_df(fit_mar)
+ymi_cols  <- grep("^Ymi_TotChol", names(draws_mar), value = TRUE)
+tc_imputed_mar  <- colMeans(draws_mar[, ymi_cols])
+tc_imputed_mnar <- tc_imputed_mar + delta
+
+## Create dataset with MNAR-tilted imputations
+nhanes_mnar <- nhanes_dat
+miss_idx    <- which(is.na(nhanes_mnar$TotChol))
+nhanes_mnar$TotChol[miss_idx] <- tc_imputed_mnar
+
+## Fit model on MNAR-adjusted data
+fit_mnar <- brm(
+  formula = BPSysAve ~ Age_z + Age_zsq + BMI_z + TotChol,
+  data    = nhanes_mnar,
+  prior   = c(
+    prior(normal(120, 10), class = "Intercept"),
+    prior(normal(5, 3),    class = "b", coef = "Age_z"),
+    prior(normal(0, 2),    class = "b", coef = "Age_zsq"),
+    prior(normal(3, 2),    class = "b", coef = "BMI_z"),
+    prior(normal(1, 1),    class = "b", coef = "TotChol"),
+    prior(normal(15, 5),   class = "sigma")
+  ),
+  chains = 4, iter = 2000, seed = 5440, refresh = 0,
+  control = list(adapt_delta = 0.95)
+)
+```
+  
+#### Sensitivity Results
+  
+```{r sensitivity-table}
+## Helper function to extract TotChol coefficient
+get_tc_row <- function(fit, coef_name) {
+  s <- posterior_summary(fit, variable = coef_name)
+  c(mean = unname(s[1, "Estimate"]),
+    lo   = unname(s[1, "Q2.5"]),
+    hi   = unname(s[1, "Q97.5"]))
+}
+
+cc_row   <- get_tc_row(fit_cc,   "b_TotChol")
+mar_row  <- get_tc_row(fit_mar,  "bsp_BPSysAve_miTotChol")
+mnar_row <- get_tc_row(fit_mnar, "b_TotChol")
+
+sens_df <- data.frame(
+  Model = c("Complete Case (MCAR)", "Data Augmentation (MAR)",
+            sprintf("MNAR tilt (+%.1f mmol/L)", delta)),
+  Mean = sprintf("%.2f", c(cc_row["mean"], mar_row["mean"], mnar_row["mean"])),
+`95% CrI` = c(
+    sprintf("(%.2f, %.2f)", cc_row["lo"], cc_row["hi"]),
+    sprintf("(%.2f, %.2f)", mar_row["lo"], mar_row["hi"]),
+    sprintf("(%.2f, %.2f)", mnar_row["lo"], mnar_row["hi"])
+  ),
+  check.names = FALSE
+)
+
+kable(sens_df, escape = FALSE,
+      col.names = c("Missingness Model", "β_TotChol (mean)", "95% CrI")) %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "bordered"),
+                full_width = FALSE, position = "center") %>%
+  column_spec(1, bold = TRUE, width = "14em") %>%
+  column_spec(2:3, width = "8em")
+```
+
+#### Interpretation
+
+The positive association between cholesterol and blood pressure **holds under all three assumptions**:
+  
+- All 95% credible intervals exclude zero
+- The MNAR tilt shifts the point estimate by ~0.1 mmHg/(mmol/L), about half a posterior SD
+- The conclusion is **robust** to MNAR departures of this magnitude
+
+  
+#### Posterior Distributions
+  
+```{r beta-sensitivity-plot, fig.height=5, fig.cap="Posterior distributions  under different missingness assumptions."}
+df_beta <- rbind(
+  data.frame(Model = "Complete Case (MCAR)",
+             beta  = as.numeric(as_draws_matrix(fit_cc, variable = "b_TotChol"))),
+  data.frame(Model = "Data Augmentation (MAR)",
+             beta  = as.numeric(as_draws_matrix(fit_mar, variable = "bsp_BPSysAve_miTotChol"))),
+  data.frame(Model = sprintf("MNAR tilt (+%.1f mmol/L)", delta),
+             beta  = as.numeric(as_draws_matrix(fit_mnar, variable = "b_TotChol")))
+)
+
+ggplot(df_beta, aes(x = beta, colour = Model, fill = Model)) +
+  geom_density(alpha = 0.25, linewidth = 1) +
+  geom_vline(xintercept = 0, linetype = "dashed", colour = "gray40") +
+  scale_color_manual(values = c(col_imp , col_obs , col_cens)) +
+  scale_fill_manual(values = c(col_imp , col_obs , col_cens)) +
+  labs(x = expression(beta[TotChol] ~ "(mmHg per mmol/L)"),
+       y = "Posterior density",
+       title = expression("Sensitivity of " * beta[TotChol] * " to Missingness Assumption")) +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+```
+
+The three posteriors largely overlap, with the MNAR tilt shifting slightly to the right. All three distributions are clearly separated from zero.
+
+#### Posterior Predictive Comparison
+
+Do the different models produce different predictions for blood pressure?
+  
+```{r ppc-sensitivity, fig.height=5, fig.cap="Posterior predictive densities are nearly indistinguishable across models."}
+yrep_cc   <- posterior_predict(fit_cc,                      ndraws = 100)
+yrep_mar  <- posterior_predict(fit_mar,  resp = "BPSysAve", ndraws = 100)
+yrep_mnar <- posterior_predict(fit_mnar,                    ndraws = 100)
+
+df_rep <- rbind(
+  data.frame(Model = "Complete Case (MCAR)",    y = as.numeric(yrep_cc)),
+  data.frame(Model = "Data Augmentation (MAR)", y = as.numeric(yrep_mar)),
+  data.frame(Model = sprintf("MNAR tilt (+%.1f mmol/L)", delta), y = as.numeric(yrep_mnar))
+)
+df_obs <- data.frame(y = nhanes_dat$BPSysAve)
+
+ggplot() +
+  geom_density(data = df_rep, aes(x = y, colour = Model, fill = Model),
+               alpha = 0.15, linewidth = 0.8) +
+  geom_density(data = df_obs, aes(x = y),
+               colour = "black", linewidth = 1.2) +
+  scale_color_manual(values = c(col_imp , col_obs , col_cens)) +
+  scale_fill_manual(values = c(col_imp , col_obs , col_cens)) +
+  labs(x = "Average Systolic BP (mmHg)",
+       y = "Density",
+       title = "Posterior Predictive Density Across Missingness Models",
+       subtitle = "Black: observed data") +
+  coord_cartesian(xlim = c(70, 220)) +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+```
+
+The marginal predictive densities are nearly identical across all three models. This confirms that the sensitivity analysis is about the **interpretation of the effect**, not about overall model fit.
+
+  
+### Key Takeaways
+  
+#### When to Worry About MNAR
+  
+Consider MNAR sensitivity analysis when:
+  
+1. **The outcome or key predictor is missing** (not just a covariate)
+2. **There is a plausible mechanism** linking the value to missingness
+3. **The missing rate is non-trivial** (>5-10%)
+4. **The scientific question is high-stakes**
+
+#### How to Conduct Sensitivity Analysis
+
+```{r sa-steps, echo=FALSE}
+steps_df <- data.frame(
+  Step = c("1", "2", "3", "4"),
+  Action = c(
+    "Fit under MAR (baseline)",
+    "Identify plausible MNAR mechanisms",
+    "Fit under MNAR with range of δ values",
+    "Report if conclusion is robust across range"
+  )
+)
+
+kable(steps_df, col.names = c("Step", "Action")) %>%
+  kable_styling(bootstrap_options = c("striped", "bordered"),
+                full_width = FALSE, position = "center") %>%
+  column_spec(1, bold = TRUE, width = "4em") %>%
+  column_spec(2, width = "28em")
+```
+
+#### Summary Table
+
+```{r summary-table-final, echo=FALSE}
+summary_df <- data.frame(
+  Approach = c("**Complete Case**", "**Multiple Imputation**", "**Data Augmentation**", "**MNAR Sensitivity**"),
+  Assumption = c("MCAR", "MAR", "MAR", "MNAR (specified)"),
+  Strength = c(
+    "Simple, no model for missingness",
+    "Flexible, handles multiple variables",
+    "Joint posterior, single coherent model",
+    "Explicitly tests robustness"
+  ),
+  Limitation = c(
+    "Discards data, biased if not MCAR",
+    "Separate imputation and analysis steps",
+    "More complex to implement",
+    "Requires specifying untestable mechanism"
+  )
+)
+
+kable(summary_df, escape = FALSE,
+      col.names = c("Approach", "Assumption", "Strength", "Limitation")) %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "bordered"),
+                full_width = FALSE, position = "center") %>%
+  column_spec(1, bold = TRUE, width = "10em") %>%
+  column_spec(2, width = "6em") %>%
+  column_spec(3:4, width = "14em")
+```
+
+> **Bottom line:** MNAR cannot be tested from data. The responsible approach is to fit under multiple plausible assumptions and report whether scientific conclusions are robust. In this NHANES example, the positive cholesterol-blood pressure association holds across MCAR, MAR, and MNAR assumptions—our conclusion is robust.
+
+
+# 2. Censored Data
+
+##  Definition
+
+Censored data arises when an observation is only partially known: the true value is known to lie within an interval $(a, b)$, but its exact location is not observed. There are three common forms.
+
+Right censoring corresponds to $(a, +\infty)$. For example, in a 12-month study tracking laptop battery life, any battery lasting beyond the study period is right-censored: we only know its life exceeds the study duration.
+
+Left censoring corresponds to $(-\infty, b)$. For example, in water quality testing, pollutant levels below a detection limit are left-censored: we only know the level falls below the threshold.
+
+Interval censoring corresponds to $(a, b)$. For example, a dentist may know only that a cavity developed between two visits, without the exact date.
+
+The symbols $-\infty$ and $+\infty$ are notational conveniences. In practice the effective bounds are determined by the problem and may be finite.
+
+##  Censored vs. Truncated Data
+
+Censoring and truncation are easily confused but differ in an important way. Censoring occurs when observations lie in certain intervals instead of being recorded as exact values. We know the censoring threshold and how many observations are censored, but not their exact values. Truncation, by contrast, occurs when observations within certain intervals are completely excluded. We may know the threshold, but we typically do not know how many observations were removed or what their exact values were.
+
+When both the truncation threshold and the number of truncated observations are known, the problem becomes similar to censoring. If either piece of information is missing, incorporating the truncation mechanism into a Bayesian model requires additional assumptions.
+
+##  Motivation
+
+Standard regression assumes that all response values are observed exactly. Treating censored values as fixed numbers therefore leads to biased parameter estimates and an incorrect likelihood, because the uncertainty in censored observations is ignored. Methods for censored data account for this uncertainty by incorporating the known constraints directly into the model, either by integrating out censored values in the likelihood or by explicitly sampling them as latent variables.
+
+Censored data arises in several settings. It is common in survival analysis and time-to-event studies, where the event may not occur within the observation window; in measurement-limited instruments, where values outside a detection range are recorded only as exceeding or falling below a threshold; and in economic and survey data, where outcomes are top-coded or bottom-coded.
+
+##  Solutions
+
+###  Assumptions and Setup
+
+Throughout this section we assume that observed and censored values come from the same underlying distribution. For simplicity, we take partially observed data to be right-censored with true values
+
+$$y_i \sim \mathcal{N}(\mu_i, \sigma^2), \quad \mu_i = \beta_0 + \beta_1 x_i,$$
+
+and define $\delta_i = 1$ if observation $i$ is fully observed and $\delta_i = 0$ if it is censored.
+
+###  Marginalization
+
+The first strategy accounts for censored observations through the probability that the true value exceeds the censoring threshold, without ever explicitly modeling those values. Censored observations are integrated out of the likelihood using CDF terms, and no latent variables are introduced.
+
+The likelihood contribution depends on the censoring pattern:
+
+- If $\delta_i = 1$: $\; p(y_i \mid \beta_0, \beta_1, \sigma)$.
+- If $\delta_i = 0$ (right-censored): $\; P(y_i > c \mid \beta_0, \beta_1, \sigma) = 1 - F(c \mid \beta_0, \beta_1, \sigma)$.
+- Left-censored: $\; F(c \mid \beta_0, \beta_1, \sigma)$.
+- Interval-censored $(a, b)$: $\; F(b \mid \beta_0, \beta_1, \sigma) - F(a \mid \beta_0, \beta_1, \sigma)$.
+
+The full likelihood combines these contributions:
+
+$$L(\beta_0, \beta_1, \sigma) = \prod_{i:\delta_i=1} p(y_i \mid \beta_0, \beta_1, \sigma) \times \prod_{i:\delta_i=0} \bigl(1 - F(c \mid \beta_0, \beta_1, \sigma)\bigr).$$
+
+The advantages of this approach are computational: it introduces no additional parameters, runs faster, and improves MCMC convergence. Its main limitation is that it requires a closed-form CDF and can be harder to adapt to complex custom models.
+
+###  Data Augmentation
+
+The second strategy treats censored observations as latent variables $y_i^{\text{mis}}$, imposes a constraint such as $y_i^{\text{mis}} > c$, and samples them during MCMC:
+
+$$y_i^{\text{mis}} \sim \mathcal{N}(\mu_i, \sigma^2), \quad y_i^{\text{mis}} > c, \quad \mu_i = \beta_0 + \beta_1 x_i.$$
+
+The likelihood now includes contributions from the latent values:
+
+$$L(\beta_0, \beta_1, \sigma) = \prod_{i:\delta_i=1} p(y_i \mid \beta_0, \beta_1, \sigma) \times \prod_{i:\delta_i=0} p(y_i^{\text{mis}} \mid \beta_0, \beta_1, \sigma).$$
+
+This approach is more flexible: it does not require a closed-form CDF and provides posterior draws for the imputed values. The trade-off is computational, since it adds one parameter per censored observation and may suffer from poor mixing when many observations are censored.
+
+##  Applied Example: Survival Analysis on the NCCTG Lung Cancer Dataset
+
+### 1 Dataset and Scientific Question
+
+We use the `lung` dataset from the `survival` package, drawn from a North Central Cancer Treatment Group (NCCTG) study of 228 patients with advanced lung cancer. The variables used are `time` (survival time in days), `status` (1 = right-censored, 2 = observed death), `age`, and `sex` (1 = male, 2 = female). After dropping three patients with missing covariates, 165 (72.4%) experienced the event and 63 (27.6%) were right-censored.
+
+The scientific question is whether sex predicts survival after adjusting for age. A Bayesian analysis lets us quantify both the magnitude and the uncertainty of any sex effect through a full posterior distribution, rather than relying on point estimates and p-values.
+
+This dataset is well-suited for demonstrating censoring methods. The 27.6% censoring rate is substantial enough to materially affect inference if mishandled. The censoring is administrative — patients alive at study end — which makes the standard non-informative-censoring assumption plausible. Finally, the sample size is large enough for meaningful inference while remaining small enough for fast iteration.
+
+### 2 Model Specification: Weibull Accelerated Failure Time (AFT)
+
+We use a Weibull accelerated failure time (AFT) model, which expresses log survival time as a linear function of covariates plus a scaled Gumbel error:
+
+$$\log T_i = \alpha + \beta_{\text{age}} \cdot \text{age}_i + \beta_{\text{sex}} \cdot \mathbb{1}[\text{sex}_i = \text{F}] + \sigma \cdot \varepsilon_i, \quad \varepsilon_i \sim \text{Gumbel}.$$
+
+Equivalently, $T_i \sim \text{Weibull}(\text{shape} = k, \text{scale} = \lambda_i)$ with $\lambda_i = \exp(\alpha + \beta_{\text{age}} \cdot \text{age}_i + \beta_{\text{sex}} \cdot \mathbb{1}[\text{sex}_i = \text{F}])$ and shape $k = 1/\sigma$.
+
+The parameters have natural interpretations. A one-year increase in age multiplies the expected survival scale by $\exp(\beta_{\text{age}})$. Females' expected survival is $\exp(\beta_{\text{sex}})$ times that of males of the same age. The shape $k$ controls the hazard function: $k = 1$ gives a constant hazard (exponential), $k > 1$ a monotone increasing hazard, and $k < 1$ a decreasing hazard.
+
+For priors, we adopt weakly informative choices. We set $\alpha \sim \mathcal{N}(5.9, 1^2)$, centered at $\log(365) \approx 5.9$ to encode a prior median survival near one year. The regression coefficients $\beta_{\text{age}}, \beta_{\text{sex}} \sim \mathcal{N}(0, 0.5^2)$ are centered at zero, allowing multiplicative effects up to roughly $\exp(\pm 1) \approx (0.37, 2.7)$ within two prior standard deviations. The shape parameter follows $k \sim \text{Gamma}(2, 2)$, with mean 1 and a 95% prior interval of approximately $(0.24, 2.79)$, restricting it to be strictly positive.
+
+Four key modeling assumptions are worth flagging. First, the Weibull family is correctly specified — checked below via a sensitivity analysis against the log-normal. Second, censoring is non-informative: censored patients have the same future hazard as those who remain. Third, the AFT structure assumes covariates act multiplicatively on the time scale. Fourth, age enters linearly with no age-by-sex interaction.
+
+### 3 Marginalization Implementation in R
+
+```{r weibull-fit, results = "hide"}
+lung <- survival::lung
+# Drop rows missing covariates
+lung <- lung[complete.cases(lung[, c("time", "status", "age", "sex")]), ]
+# brms cens() expects "right" / "none" labels; sex as factor for dummy coding
+lung$censored <- ifelse(lung$status == 1, "right", "none")
+lung$sex      <- factor(lung$sex)
+
+# Marginalization: cens() integrates censored obs via the survival function
+fit_weibull <- brm(
+  formula = time | cens(censored) ~ age + sex,
+  family  = weibull(),
+  data    = lung,
+  prior   = c(
+    prior(normal(5.9, 1), class = "Intercept"),
+    prior(normal(0, 0.5), class = "b"),
+    prior(gamma(2, 2),    class = "shape")
+  ),
+  chains = 4, iter = 2000, warmup = 1000, seed = 5440, refresh = 0
+)
+
+# Log-normal AFT for sensitivity check (no shape parameter)
+fit_lognormal <- brm(
+  formula = time | cens(censored) ~ age + sex,
+  family  = lognormal(),
+  data    = lung,
+  prior   = c(
+    prior(normal(5.9, 1), class = "Intercept"),
+    prior(normal(0, 0.5), class = "b")
+  ),
+  chains = 4, iter = 2000, warmup = 1000, seed = 5440, refresh = 0
+)
+```
+
+#### Fit and Diagnostics
+
+```{r weibull-diag}
+cat("\n===== DIAGNOSTICS: WEIBULL =====\n")
+
+# Convergence checks: R-hat near 1, sufficient ESS, no divergences
+rhats <- brms::rhat(fit_weibull)
+cat("Max Rhat:", round(max(rhats, na.rm = TRUE), 4), "\n")
+cat("Any Rhat > 1.01:", any(rhats > 1.01, na.rm = TRUE), "\n")
+
+neffs <- brms::neff_ratio(fit_weibull)
+cat("Min Neff ratio:", round(min(neffs, na.rm = TRUE), 3), "\n")
+
+np <- nuts_params(fit_weibull)
+cat("Divergences:", sum(np$Value[np$Parameter == "divergent__"]), "\n")
+```
+
+The maximum R-hat is well below 1.01, the minimum effective sample size ratio is comfortably above 0.1, and there are zero divergent transitions. The chains have converged and mixed well, so we can proceed to inference.
+
+#### Posterior Summaries
+
+```{r weibull-summary}
+cat("\n===== POSTERIOR SUMMARY: WEIBULL =====\n")
+print(summary(fit_weibull))
+
+# Median Weibull survival = scale * (log 2)^(1/shape), evaluated at mean age
+mean_age <- mean(lung$age)
+draws_w  <- as_draws_df(fit_weibull)
+
+med_male_w   <- exp(draws_w$b_Intercept + draws_w$b_age * mean_age) *
+                (log(2))^(1 / draws_w$shape)
+med_female_w <- exp(draws_w$b_Intercept + draws_w$b_age * mean_age + draws_w$b_sex2) *
+                (log(2))^(1 / draws_w$shape)
+
+cat("\nMedian survival MALE   (Weibull):", round(median(med_male_w), 1),
+    " 95% CrI:", round(quantile(med_male_w, 0.025), 1),
+    "-", round(quantile(med_male_w, 0.975), 1), "\n")
+cat("Median survival FEMALE (Weibull):", round(median(med_female_w), 1),
+    " 95% CrI:", round(quantile(med_female_w, 0.025), 1),
+    "-", round(quantile(med_female_w, 0.975), 1), "\n")
+cat("\nPosterior P(beta_sex > 0):", round(mean(draws_w$b_sex2 > 0), 4), "\n")
+```
+
+Holding age constant at the sample mean (about 62.5 years), the posterior median survival is approximately 256 days for males and 368 days for females. The posterior median of $\beta_{\text{sex}}$ is 0.37, with a 95% credible interval of (0.14, 0.62) and $P(\beta_{\text{sex}} > 0) \approx 1$. This constitutes strong evidence of a positive sex effect on survival time. The age effect, by contrast, is small, with a 95% credible interval that nearly straddles zero.
+
+#### Posterior Predictive Check
+
+```{r weibull-ppc}
+cat("\n===== PPC 1: FRACTION CENSORED =====\n")
+
+pp       <- posterior_predict(fit_weibull)
+followup <- lung$time
+
+obs_cens_frac <- mean(lung$censored == "right")
+cat("Observed fraction censored:", round(obs_cens_frac, 3), "\n")
+
+# For each draw, count simulated times exceeding each patient's follow-up
+sim_cens_frac <- apply(pp, 1, function(yrep) mean(yrep > followup))
+cat("Posterior 95% interval for fraction censored:",
+    round(quantile(sim_cens_frac, 0.025), 3), "-",
+    round(quantile(sim_cens_frac, 0.975), 3), "\n")
+```
+
+The observed fraction censored (0.276) sits below the posterior predictive 95% interval (about 0.50 to 0.64). This discrepancy is largely an artifact of the PPC design: for patients who died, we used their event time as the follow-up window, so simulated survival times exceed it roughly half the time by construction. The Kaplan-Meier overlay below is the more appropriate PPC for survival data.
+
+```{r km-ppc, fig.width = 8, fig.height = 5}
+km_obs    <- survfit(Surv(time, status == 2) ~ 1, data = lung)
+km_obs_df <- data.frame(time = km_obs$time, surv = km_obs$surv)
+
+set.seed(5440)
+draw_idx    <- sample(seq_len(nrow(pp)), 50)
+km_rep_list <- list()
+n_failed    <- 0
+
+# Build KM curves from posterior predictive draws, applying the same follow-up
+for (i in seq_along(draw_idx)) {
+  d     <- draw_idx[i]
+  t_sim <- pp[d, ]
+  t_sim[!is.finite(t_sim)] <- max(followup) * 10  # guard against extreme tails
+
+  cens_sim  <- as.integer(t_sim <= followup)
+  t_obs_sim <- pmin(t_sim, followup)
+
+  if (sum(cens_sim) == 0) { n_failed <- n_failed + 1; next }
+
+  km_d <- tryCatch(survfit(Surv(t_obs_sim, cens_sim) ~ 1), error = function(e) NULL)
+
+  if (!is.null(km_d)) {
+    km_rep_list[[length(km_rep_list) + 1]] <-
+      data.frame(time = km_d$time, surv = km_d$surv, draw = d)
+  } else {
+    n_failed <- n_failed + 1
+  }
+}
+
+km_rep_df <- do.call(rbind, km_rep_list)
+cat("K-M PPC: successful draws =", length(km_rep_list), "/ skipped =", n_failed, "\n")
+
+ggplot() +
+  geom_step(data = km_rep_df, aes(x = time, y = surv, group = draw),
+            color = col_obs, alpha = 0.20) +
+  geom_step(data = km_obs_df, aes(x = time, y = surv),
+            color = col_true, linewidth = 1.0) +
+  coord_cartesian(xlim = c(0, max(lung$time)), ylim = c(0, 1)) +
+  labs(title    = "Posterior Predictive Check: Kaplan-Meier Overlay",
+       subtitle = "Black = observed K-M curve | Blue = 50 posterior predictive draws",
+       x = "Time (days)", y = "Survival probability") +
+  theme_minimal()
+```
+
+The observed K-M curve (black) sits within the cloud of posterior predictive curves (blue) across most of the follow-up range, indicating adequate fit. Some deviation appears in the right tail, where the Weibull tends to under-predict the long-survivor fraction — a known limitation of the monotone-hazard Weibull family and one motivation for the log-normal sensitivity analysis below.
+
+#### Sensitivity Analysis: Weibull vs. Log-normal
+
+```{r sensitivity}
+cat("\n===== POSTERIOR SUMMARY: LOG-NORMAL =====\n")
+print(summary(fit_lognormal))
+
+# Log-normal median survival = exp(linear predictor)
+draws_ln <- as_draws_df(fit_lognormal)
+
+med_male_ln   <- exp(draws_ln$b_Intercept + draws_ln$b_age * mean_age)
+med_female_ln <- exp(draws_ln$b_Intercept + draws_ln$b_age * mean_age + draws_ln$b_sex2)
+
+cat("\nMedian survival MALE   (Log-normal):", round(median(med_male_ln), 1),
+    " 95% CrI:", round(quantile(med_male_ln, 0.025), 1),
+    "-", round(quantile(med_male_ln, 0.975), 1), "\n")
+cat("Median survival FEMALE (Log-normal):", round(median(med_female_ln), 1),
+    " 95% CrI:", round(quantile(med_female_ln, 0.025), 1),
+    "-", round(quantile(med_female_ln, 0.975), 1), "\n")
+
+cat("\nbeta_sex Weibull  - Mean:", round(mean(draws_w$b_sex2), 3),
+    " 95% CrI:", round(quantile(draws_w$b_sex2, 0.025), 3),
+    "-", round(quantile(draws_w$b_sex2, 0.975), 3), "\n")
+cat("beta_sex Log-norm - Mean:", round(mean(draws_ln$b_sex2), 3),
+    " 95% CrI:", round(quantile(draws_ln$b_sex2, 0.025), 3),
+    "-", round(quantile(draws_ln$b_sex2, 0.975), 3), "\n")
+```
+
+Under the log-normal AFT, $\beta_{\text{sex}}$ has posterior mean 0.48 (95% CrI: 0.19 to 0.78), compared to 0.37 (0.14 to 0.62) under the Weibull. The point estimate shifts modestly (about 30%), but both credible intervals comfortably exclude zero. The qualitative conclusion — that females have longer survival — is therefore robust to the choice of parametric family.
+
+#### Diagnostic Figures
+
+```{r weibull-figs, results = "hide"}
+p_trace <- mcmc_trace(as_draws_array(fit_weibull),
+                      pars = c("b_Intercept", "b_age", "b_sex2", "shape")) +
+           ggtitle("Trace Plots — Weibull Model")
+
+p_rhat  <- mcmc_rhat(brms::rhat(fit_weibull)) +
+           ggtitle("R-hat Values — Weibull Model")
+
+p_neff  <- mcmc_neff(brms::neff_ratio(fit_weibull)) +
+           ggtitle("Effective Sample Size Ratios — Weibull Model")
+
+p_ppc   <- pp_check(fit_weibull, ndraws = 50) +
+           ggtitle("Posterior Predictive Check (uncensored bulk) — Weibull")
+
+ggsave("traceplots.png", p_trace, width = 10, height = 6, dpi = 150)
+ggsave("rhat.png",       p_rhat,  width = 6,  height = 4, dpi = 150)
+ggsave("neff.png",       p_neff,  width = 6,  height = 4, dpi = 150)
+ggsave("ppc.png",        p_ppc,   width = 7,  height = 4, dpi = 150)
+```
+
+```{r show-figs, echo = FALSE, fig.width = 9}
+print(p_trace)
+print(p_rhat)
+print(p_neff)
+print(p_ppc)
+```
+
+### 4 Data Augmentation Implementation in R
+
+We now implement the same model in raw Stan via data augmentation, declaring the censored event times as constrained latent parameters.
+
+```{r stan-fit, results = "hide"}
+lung$sex_num <- as.numeric(lung$sex == 2)
+idx_obs      <- which(lung$status == 2)
+idx_cens     <- which(lung$status == 1)
+
+cat("Total patients:", nrow(lung), "\n")
+cat("Observed deaths:", length(idx_obs), "\n")
+cat("Censored:", length(idx_cens),
+    paste0("(", round(100 * length(idx_cens) / nrow(lung), 1), "%)"), "\n\n")
+
+# Center age so the intercept reflects an average-age patient
+mean_age          <- mean(lung$age)
+age_centered_obs  <- lung$age[idx_obs]  - mean_age
+age_centered_cens <- lung$age[idx_cens] - mean_age
+
+stan_data <- list(
+  N_obs        = length(idx_obs),
+  N_cens       = length(idx_cens),
+  t_obs        = lung$time[idx_obs],
+  t_cens_lower = lung$time[idx_cens],
+  X_obs        = cbind(age_centered_obs,  lung$sex_num[idx_obs]),
+  X_cens       = cbind(age_centered_cens, lung$sex_num[idx_cens])
+)
+
+# Latent t_cens is bounded below by the censoring time, enforcing T_i > c_i
+stan_code <- "
+data {
+  int<lower=0> N_obs;
+  int<lower=0> N_cens;
+  vector<lower=0>[N_obs]  t_obs;
+  vector<lower=0>[N_cens] t_cens_lower;
+  matrix[N_obs,  2] X_obs;
+  matrix[N_cens, 2] X_cens;
+}
+parameters {
+  real          alpha;
+  vector[2]     beta;
+  real<lower=0> shape;
+  vector<lower=t_cens_lower>[N_cens] t_cens;
+}
+model {
+  alpha ~ normal(5.9, 1);
+  beta  ~ normal(0, 0.5);
+  shape ~ gamma(2, 2);
+  t_obs ~ weibull(shape, exp(alpha + X_obs * beta));
+  for (i in 1:N_cens)
+    t_cens[i] ~ weibull(shape, exp(alpha + X_cens[i] * beta));
+}
+generated quantities {
+  real med_male   = exp(alpha)           * pow(log(2), 1.0 / shape);
+  real med_female = exp(alpha + beta[2]) * pow(log(2), 1.0 / shape);
+}
+"
+
+# Initialize latent times above thresholds to avoid invalid starting points
+init_fn <- function() {
+  list(alpha = 5.9, beta = c(0.0, 0.0), shape = 1.2,
+       t_cens = stan_data$t_cens_lower * 2.0)
+}
+
+fit_augmentation <- stan(
+  model_code = stan_code, data = stan_data,
+  chains = 4, iter = 2000, warmup = 1000, seed = 5440, refresh = 0, init = init_fn
+)
+```
+
+#### Fit and Diagnostics
+
+```{r stan-diag}
+cat("\n===== DIAGNOSTICS: DATA AUGMENTATION =====\n")
+
+params_of_interest <- c("alpha", "beta[1]", "beta[2]", "shape", "med_male", "med_female")
+print(fit_augmentation, pars = params_of_interest, probs = c(0.025, 0.5, 0.975))
+
+sampler_params <- get_sampler_params(fit_augmentation, inc_warmup = FALSE)
+divergences    <- sum(sapply(sampler_params, function(x) sum(x[, "divergent__"])))
+cat("\nTotal divergences:", divergences, "\n")
+
+rhats_aug <- summary(fit_augmentation)$summary[params_of_interest, "Rhat"]
+cat("Max Rhat (structural params):", round(max(rhats_aug, na.rm = TRUE), 4), "\n")
+```
+
+Zero divergent transitions and a maximum R-hat near 1.00 confirm convergence. The augmentation model adds 63 latent event-time parameters — one per censored patient — to the four structural parameters of the marginalization model. This is the computational cost referenced in Section 2.4.3.
+
+#### Trace Plots
+
+```{r stan-trace, fig.width = 10, fig.height = 6}
+draws_array <- as.array(fit_augmentation,
+                        pars = c("alpha", "beta[1]", "beta[2]", "shape"))
+
+p_trace_aug <- mcmc_trace(draws_array) +
+  ggtitle("Trace Plots — Weibull Data Augmentation",
+          subtitle = "4 chains, 1000 post-warmup draws each") +
+  theme_minimal()
+
+ggsave("augmentation_traceplots.png", p_trace_aug, width = 10, height = 6, dpi = 150)
+p_trace_aug
+```
+
+#### Posterior of Imputed Event Times
+
+A unique benefit of data augmentation is that we obtain a posterior distribution for each censored patient's event time, ordered here by the censoring threshold.
+
+```{r stan-latent, fig.width = 10, fig.height = 5}
+draws_df  <- as.data.frame(fit_augmentation)
+cens_cols <- grep("^t_cens\\[", names(draws_df), value = TRUE)
+
+# Posterior median + 95% CrI for each latent event time
+latent_summary <- data.frame(
+  patient_id  = seq_along(idx_cens),
+  cens_lower  = stan_data$t_cens_lower,
+  post_median = sapply(cens_cols, function(col) median(draws_df[[col]])),
+  post_lower  = sapply(cens_cols, function(col) quantile(draws_df[[col]], 0.025)),
+  post_upper  = sapply(cens_cols, function(col) quantile(draws_df[[col]], 0.975))
+) %>% arrange(cens_lower)
+
+ggplot(latent_summary, aes(x = reorder(patient_id, cens_lower))) +
+  geom_errorbar(aes(ymin = post_lower, ymax = post_upper),
+                color = col_obs, alpha = 0.5, width = 0) +
+  geom_point(aes(y = post_median), color = col_obs, size = 1) +
+  geom_point(aes(y = cens_lower),  color = col_cens, size = 1, shape = 4) +
+  labs(title    = "Posterior Distributions of Latent Event Times",
+       subtitle = "Blue = posterior median + 95% CrI | Red cross = censoring threshold",
+       x = "Censored patients (ordered by censoring time)", y = "Survival time (days)") +
+  theme_minimal() +
+  theme(axis.text.x = element_blank(), axis.ticks.x = element_blank())
+```
+
+Every posterior interval lies strictly above its censoring threshold, as required by the model. Patients with later censoring times have posterior medians shifted further to the right, reflecting the fact that they have already survived longer. This plot is unique to data augmentation: marginalization never produces posterior draws of the censored patients' event times.
+
+#### Method Comparison: Augmentation vs. Marginalization
+
+If the two parameterizations are mathematically equivalent, their posteriors for the structural parameters should agree.
+
+```{r method-compare, fig.width = 8, fig.height = 5}
+draws_marg    <- as_draws_df(fit_weibull)
+beta_sex_marg <- draws_marg$b_sex2
+beta_sex_aug  <- draws_df[["beta[2]"]]
+
+compare_df <- data.frame(
+  beta_sex = c(beta_sex_marg, beta_sex_aug),
+  Method   = c(rep("Marginalization (brms)",   length(beta_sex_marg)),
+               rep("Data Augmentation (Stan)", length(beta_sex_aug)))
+)
+
+ggplot(compare_df, aes(x = beta_sex, fill = Method)) +
+  geom_density(alpha = 0.5) +
+  scale_fill_manual(values = c("Marginalization (brms)"   = col_marg,
+                               "Data Augmentation (Stan)" = col_aug)) +
+  labs(title    = "Posterior of beta_sex: Augmentation vs. Marginalization",
+       subtitle = "Both methods should produce identical posteriors",
+       x = "beta_sex (female vs. male, log-time scale)", y = "Density") +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+
+cat("\n===== METHOD COMPARISON: beta_sex =====\n")
+cat("Marginalization - Mean:", round(mean(beta_sex_marg), 3),
+    " 95% CrI:", round(quantile(beta_sex_marg, 0.025), 3),
+    "-", round(quantile(beta_sex_marg, 0.975), 3), "\n")
+cat("Augmentation   - Mean:", round(mean(beta_sex_aug), 3),
+    " 95% CrI:", round(quantile(beta_sex_aug, 0.025), 3),
+    "-", round(quantile(beta_sex_aug, 0.975), 3), "\n")
+
+cat("\nData augmentation introduces", length(idx_cens), "latent parameters.\n")
+cat("Marginalization uses 0 latent parameters.\n")
+cat("Both target the same posterior for alpha, beta, shape.\n")
+```
+
+Marginalization and data augmentation produce essentially identical posterior densities for $\beta_{\text{sex}}$, with posterior means agreeing to within 0.005. This is exactly what theory predicts: the two parameterizations are mathematically equivalent. The choice between them is therefore driven by engineering, not statistics. Marginalization is simpler and faster when a closed-form CDF is available; data augmentation is more flexible for custom likelihoods and additionally yields posterior draws of the imputed event times.
+
+### 5 Sensitivity Analysis: What If We Had Ignored Censoring?
+
+The most consequential modeling decision in any survival analysis is whether to handle censoring at all. To make this concrete, we now fit a naive Weibull regression that treats every recorded time as an exact event time, then compare its posterior to the censoring-aware approaches.
+
+```{r naive-fit, results = "hide"}
+# Naive: same priors and family but no cens() handling
+fit_fixed <- brm(
+  formula = time ~ age + sex,
+  family  = weibull(),
+  data    = lung,
+  prior   = c(
+    prior(normal(5.9, 1), class = "Intercept"),
+    prior(normal(0, 0.5), class = "b"),
+    prior(gamma(2, 2),    class = "shape")
+  ),
+  chains = 4, iter = 2000, warmup = 1000, seed = 5440, refresh = 0
+)
+```
+
+```{r naive-compare, fig.width = 8, fig.height = 5}
+draws_marg_plot <- as_draws_df(fit_weibull) %>%
+  transmute(method = "Censoring (Marginalization)", age = b_age, sex = b_sex2)
+
+draws_aug_plot <- as.data.frame(fit_augmentation) %>%
+  transmute(method = "Censoring (Data Augmentation)", age = `beta[1]`, sex = `beta[2]`)
+
+draws_fixed_plot <- as_draws_df(fit_fixed) %>%
+  transmute(method = "Ignore Censoring (Naive)", age = b_age, sex = b_sex2)
+
+# Pool the three sets of draws and summarise to mean + 95% CrI
+coef_plot_data <- bind_rows(draws_marg_plot, draws_aug_plot, draws_fixed_plot) %>%
+  pivot_longer(cols = c(age, sex), names_to = "term", values_to = "value") %>%
+  group_by(method, term) %>%
+  summarise(mean  = mean(value),
+            lower = quantile(value, 0.025),
+            upper = quantile(value, 0.975),
+            .groups = "drop") %>%
+  mutate(term = recode(term, age = "Age", sex = "Sex (Female vs. Male)"))
+
+ggplot(coef_plot_data,
+       aes(x = term, y = mean, ymin = lower, ymax = upper, color = method)) +
+  geom_pointrange(position = position_dodge(width = 0.45), linewidth = 0.7) +
+  geom_hline(yintercept = 0, linetype = 2, color = "grey40") +
+  scale_color_manual(values = c("Censoring (Marginalization)"   = col_marg,
+                                "Censoring (Data Augmentation)" = col_aug,
+                                "Ignore Censoring (Naive)"      = col_naive)) +
+  labs(title = "Posterior Regression Coefficients: Censoring vs. Ignoring Censoring",
+       x = NULL, y = "Posterior estimate with 95% CrI", color = NULL) +
+  theme_bw(base_size = 12)
+```
+
+The naive model that treats censored observations as fully observed event times severely underestimates the sex effect: its posterior mean shrinks by roughly 63%, and its 95% credible interval crosses zero, leading to the qualitatively misleading conclusion that there is no clear sex effect. This happens because female patients are over-represented among the censored group — they survive longer and are more likely to be alive at study end — so pretending their censoring times are death times artificially shrinks the female-male difference toward zero. The lesson generalizes: failing to model censoring is not a conservative choice but a wrong one, and it can flip the direction of the substantive conclusion.
+
+##  Discussion
+
+### What Did We Learn?
+
+Females have approximately 44% longer median survival than males of the same age (Weibull AFT: median 368 vs. 256 days; $\beta_{\text{sex}}$ posterior mean 0.37, 95% CrI 0.14 to 0.62, $P(\beta_{\text{sex}} > 0) \approx 1$). The age effect is small, with a 95% credible interval that nearly contains zero ($\beta_{\text{age}}$ approximately $-0.013$, 95% CrI $-0.029$ to $0.001$); this may reflect limited power rather than a true null effect.
+
+Marginalization and data augmentation produce essentially identical posteriors for the structural parameters ($\beta_{\text{sex}}$: 0.367 vs. 0.363), as theory predicts. Marginalization is simpler and faster, while data augmentation additionally yields imputed event times for censored patients.
+
+### Limitations
+
+Several caveats deserve emphasis. The parametric family is an untestable assumption — both the Weibull and the log-normal fit the observed data but extrapolate differently. The covariate set is also limited: it likely omits performance status (`ph.ecog`), a strong prognostic indicator whose absence may inflate the apparent sex effect. The non-informative censoring assumption cannot be tested directly with these data. Finally, the analysis assumes that sex and age act additively on log survival time with a linear age effect, which biology does not require.
+
+### When Should We Use This Model?
+
+The Weibull AFT with marginalization is a sensible default when the outcome is a positive continuous time-to-event, some observations are censored, a monotone hazard is plausible, and covariate effects are best expressed as multiplicative changes in survival time. The log-normal AFT is preferable when a non-monotone hazard is expected. Cox proportional hazards avoids specifying the baseline hazard parametrically. Stan data augmentation becomes preferable when the censored likelihood lacks a closed-form CDF or when posterior draws of imputed event times are needed downstream.
+
+# 3. Summary and Takeaways
+
+In this tutorial we have studied missing data and censored data as two versions of the same underlying problem: in both cases the missingness mechanism cannot be ignored, and it directly affects the validity of inference. Throughout, we have argued that a Bayesian approach addresses this issue by incorporating the missingness mechanism into the model itself. The strategy can be summarized in three steps.
+
+First, we augment the model. This involves expanding the parameter space to treat the gaps in our data as latent variables — unknowns that are estimated alongside our model parameters.
+
+Second, we constrain these gaps using the available information. For missing data, we leverage the joint distribution and correlations between observed and unobserved variables to inform the missing values. For censored data, we apply known physical or temporal boundaries; for example, if a study ends before an event occurs, we constrain the latent variable by the fact that it must fall in the future ($Y_i > c_i$).
+
+Finally, we propagate that uncertainty. By marginalizing over the posterior distribution of these augmented values, the model ensures that the final estimates for our parameters account for the fact that some of the data are also estimated.
+
+It is worth noting that these solutions rely on identifying assumptions about the nature of the missingness that cannot be verified from the observed data alone. For missing data we typically assume Missing at Random, where the probability of missingness depends only on observed data. For censored data we assume non-informative censoring, where the reason for censoring is independent of the event time itself.
+
+Because standard posterior predictive checks are restricted to the data we can actually see, we are inherently unable to validate these assumptions about the unobserved mechanism. To address this, we rely on sensitivity analysis — perturbing our assumptions and observing whether our conclusions remain robust or shift. This approach is a transparent way to demonstrate the stability of our results.
+
+## Decision Guide
+
+```{r decision-table, echo=FALSE}
+decision_df <- data.frame(
+  Situation = c(
+    "Missing data, many mixed-type predictors",
+    "Missing outcome, or joint posterior over $(\\theta, y^{\\text{mis}})$ needed",
+    "MNAR concern",
+    "Censored data, closed-form CDF available",
+    "Censored data, no closed-form CDF, or imputed event times needed",
+    "Informative censoring"
+  ),
+  `Recommended approach` = c(
+    "`mice` + `brm_multiple()`",
+    "Stan data augmentation",
+    "Selection or pattern-mixture model with sensitivity analysis",
+    "Marginalization (`brms cens()`, `lccdf`)",
+    "Stan data augmentation",
+    "Joint model of event and censoring processes"
+  ),
+  check.names = FALSE
+)
+
+style_table(
+  kable(decision_df, escape = FALSE, align = "ll",
+        col.names = c("Situation", "Recommended approach"))
+) %>%
+  column_spec(1, width = "22em") %>%
+  column_spec(2, width = "22em")
+```
+
+## Session Information
+
+```{r session-info}
+sessionInfo()
+```
