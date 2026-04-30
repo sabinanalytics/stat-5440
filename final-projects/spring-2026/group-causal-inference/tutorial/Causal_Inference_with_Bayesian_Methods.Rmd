@@ -1,0 +1,776 @@
+---
+title: "Causal Inference With Bayesian Methods"
+author: "Aisha Sallah - Gina Kim - Tianhai Zhou and Roger Armand Saumure"
+date: "2026-04-29"
+output:
+  pdf_document:
+    latex_engine: xelatex
+---
+
+# Causal Inference with Bayesian Methods
+
+*STAT 5440 - Applied Bayesian Modeling - Spring 2026*
+
+*Aisha Sallah - Gina Kim - Tianhai Zhou and Roger Armand Saumure*
+
+This tutorial walks through an example of using synthetic controls for causal inference in both Frequentist and Bayesian frameworks, highlighting the advantage of using a Bayesian principles in causal inference.
+
+## I. Introduction to Causal Inference
+
+In causal inference, the goal is to draw conclusions about cause-and-effect relationships from data. Most of what we observe in data is correlation, but correlation is not causation. When evaluating a treatment, we want to know whether it truly causes an outcome, rather than being correlated with some confounder that is the real driver. The aim is to separate the true causal effect from noise introduced by confounders — a distinction that matters across healthcare, decision science, business, and economics. The Counterfactual Problem To know whether a treatment causes an outcome — for example, whether a drug causes remission — we would ideally observe what each individual's outcome would have been with and without treatment. But only one of these can ever be observed per person: a patient either receives the drug or they don't. The unobserved outcome is the counterfactual, and estimating it is the central problem of causal inference.
+
+This is formalized in the Neyman-Rubin potential outcomes framework. For each unit $x_i$, two potential outcomes exist:
+
+$Y_0(x_i)$ — the outcome under no treatment (the control outcome) $Y_1(xi)$ — the outcome under treatment (the treated outcome)
+
+Only one is ever observed; the other is missing.
+
+### Estimands of Interest
+
+Since we cannot observe both potential outcomes for the same individual, we estimate causal effects in expectation. Two estimands are of primary interest:
+
+**Conditional Average Treatment Effect (CATE)** — the expected treatment effect for an individual with covariates $x_i$:
+
+$$\tau(x_i) = \mathbb{E}[Y_1 - Y_0 \mid X = x_i]$$ **Average Treatment Effect (ATE)** — the average effect across the population:
+
+$$\text{ATE} = \mathbb{E}[Y_1 - Y_0] = \mathbb{E}_X[\tau(X)]$$ The ATE is simply the CATE averaged over the covariate distribution.
+
+### Common Methods
+
+A number of methods have been developed to estimate these quantities — including propensity score matching, difference-in-differences, regression discontinuity design, and instrumental variables — each with its own identification strategy and assumptions. This tutorial focuses on synthetic control, which is particularly well suited to the data used here and clearly highlights the advantages of the Bayesian framework over its frequentist counterpart. Several of the other methods could also be applied to this analysis; the appropriate choice ultimately depends on the available data, study design, methodology, and the specific question being asked.
+
+### Why a Bayesian Framework?
+
+All of the methods above can be formulated in either a frequentist or a Bayesian framework. Frequentist implementations return point estimates with confidence intervals, while Bayesian implementations place priors on the relevant quantities and return full posterior distributions over the effects of interest. This distinction matters most for synthetic control. Frequentist inference relies on placebo tests, which are constrained by the number of donors available and do not provide a full characterization of uncertainty at every post-intervention time point. A Bayesian formulation addresses this directly: by placing priors on the donor weights and the outcome model, we obtain a full posterior distribution over the treatment effect at every time point post-intervention. This yields:
+
+Coherent uncertainty quantification at every time point, not just an aggregate p-value The ability to incorporate prior knowledge about plausible weights or effect sizes Natural propagation of uncertainty from the weights through to the estimated effect
+
+## II. Dataset and Model
+
+### The Research Question
+
+On May 12, 2021, Ohio Governor Mike DeWine announced "Vax-a-Million" — a state-run lottery in which any Ohio adult who had received at least one dose of a COVID-19 vaccine would be entered into a drawing for a \$1 million prize. The intervention was unprecedented in its use of a financial incentive at the population level, and it raises a clean causal question:
+
+*Did Ohio's Vax-a-Million lottery cause an increase in COVID-19 vaccination rates among Ohio adults, or would those rates have risen at the same pace without it?*
+
+This question cannot be answered with a simple before/after comparison. Vaccination rates were rising rapidly across the entire country in spring 2021 — supply was expanding, the Delta variant was beginning to drive concern, and many employers and universities were pushing their populations toward vaccination. A pre/post comparison in Ohio alone would conflate the lottery's effect with this nationwide upward trend, almost certainly overstating its impact. What we need is a credible estimate of $Y_0$ for Ohio in the post-treatment period: the vaccination trajectory Ohio *would have followed* had the lottery never been announced. Synthetic control gives us exactly this object.
+
+### Data Source
+
+The vaccination data come from the CDC's *COVID-19 Vaccinations in the United States, County* dataset, which reports daily, jurisdiction-level cumulative vaccination counts and is publicly available at:
+
+<https://data.cdc.gov/Vaccinations/COVID-19-Vaccinations-in-the-United-States-County/8xkx-amqh/about_data>
+
+For this analysis we aggregate the county-level series to the state level and follow the specification of Fuller et al. (2022), augmenting the CDC vaccination series with state-level demographic, political, and survey covariates from public sources (the U.S. Census, the 2020 presidential election results, and the Census Bureau's Household Pulse Survey on vaccination intent). The combined panel covers all 51 jurisdictions (50 states plus the District of Columbia) at daily frequency.
+
+The outcome variable is `Administered_Dose1_Recip_18PlusPop_Pct` — the cumulative percentage of each state's 18-and-over population that has received at least one vaccine dose. We focus on first-dose uptake (rather than full vaccination) because the lottery was conditioned on receipt of at least one dose, so this is the margin most directly affected by the policy.
+
+### Treated Unit, Donor Pool, and Time Window
+
+The **treated unit** is Ohio (`OH`). The **treatment date** is \$T_0 = \$ May 12, 2021 — the day the lottery was announced. The **donor pool** consists of 31 states that did not run vaccine lotteries during the period of analysis; states that subsequently introduced their own lottery programs are excluded so that the synthetic control is built only from genuinely untreated comparison units.
+
+The analysis window runs from April 19, 2021 to early August 2021, giving roughly 23 days of pre-treatment observations and approximately 80 days of post-treatment follow-up. The pre-treatment period is what the synthetic control method uses to pin down the donor weights; the post-treatment period is where we read off the estimated effect.
+
+### Matching Variables
+
+Beyond the daily vaccination series itself, we match Ohio to its synthetic counterpart on 13 state-level covariates spanning four broad categories:
+
+-   *Political and economic context*: 2020 Democratic two-party vote share, income per capita
+-   *Demographics*: percentage over 65, percentage with a bachelor's degree or higher, racial composition (white, Black, Hispanic), population density
+-   *Vaccine attitudes* (from the Household Pulse Survey, measured pre-treatment): the share of respondents who said they would *definitely*, *probably*, *probably not*, or *definitely not* get vaccinated, plus those who were *unsure*
+-   *Pandemic severity*: pre-treatment averages of daily case and death counts
+
+These covariates serve two purposes. In the frequentist specification, they enter the optimization that selects donor weights, helping ensure the synthetic Ohio resembles real Ohio along dimensions that plausibly drive vaccination behavior. In the Bayesian specification (Section IV), they appear as a second likelihood term that pulls the donor-weight posterior toward configurations under which $\mathbf{Z}_{\text{donors}} \boldsymbol{\beta} \approx \mathbf{Z}_{\text{Ohio}}$, regularizing the estimation in addition to the horseshoe prior on the weights.
+
+### Mapping to the Potential Outcomes Framework
+
+In the notation of Section I, Ohio is the single treated unit ($i = 0$) and we observe its post-treatment outcome $Y_{0t}$ for $t > T_0$ — this is the realized trajectory under treatment, $Y_1$. The donor states provide the raw material from which we estimate the missing $Y_0$ for Ohio: the vaccination rate Ohio would have had absent the lottery. The estimated daily treatment effect is
+
+$$\hat{\alpha}_t = Y_{0t} - Y_{0t}^{\text{synth}} \quad \text{for } t > T_0,$$ and the time-averaged daily difference (TADD) over the post-treatment period,
+
+$$\text{TADD} = \frac{1}{T - T_0} \sum_{t = T_0 + 1}^{T} \hat{\alpha}_t,$$
+
+is our summary measure of the lottery's effect on first-dose uptake. The remainder of the tutorial is concerned with two ways of estimating $Y_{0t}^{\text{synth}}$ — first frequentist, then Bayesian — and with what each approach lets us say about the resulting causal estimate.
+
+## III. Frequentist Framework
+
+Before moving to the Bayesian formulation, we decided to first implement a classical frequentist synthetic control. We wanted a concrete baseline to compare against — running the standard approach on our own data gives us a clear reference point and lets us show, rather than just describe, what the Bayesian framework adds. The contrast in how each approach handles uncertainty becomes much easier to see once both are applied to the same problem.
+
+The plot below shows the trend in Ohio's actual versus synthetic (counterfactual) vaccination rates before and after the lottery announcement on May 12, 2021
+
+```{r,echo=FALSE, warning=FALSE, cache=TRUE}
+library(tidysynth)
+library(tidyverse)
+library(rstan)
+library(ggplot2)
+library(tidyr)
+library(dplyr)
+library(knitr)
+
+options(mc.cores = parallel::detectCores())
+rstan_options(auto_write = TRUE)
+
+navy = "#1F355A"
+red  = "#8C2A35"
+
+load("/Users/asallah/Desktop/synth_data_clean.RData")
+```
+
+```{r,echo=FALSE, warning=FALSE, cache=TRUE}
+# =============================================================================
+# FREQUENTIST SYNTHETIC CONTROL (FULLER ET AL. 2022 SPECIFICATION)
+# =============================================================================
+
+i = "OH"
+treatment_date = as.Date("2021-05-12")
+
+x = subset(state_vaccines, state_vaccines$state %in% i)
+x = rbind(x, untreated_states)
+x = x[order(x$date, x$state), ]
+x = x[x$date >= as.Date("2021-04-19"), ]
+
+state_vaccines_out = x %>%
+  synthetic_control(
+    outcome           = Administered_Dose1_Recip_18PlusPop_Pct,
+    unit              = state,
+    time              = date,
+    i_unit            = i,
+    i_time            = treatment_date,
+    generate_placebos = TRUE
+  ) %>%
+  generate_predictor(
+    time_window                     = as.Date("2021-04-19"),
+    pres_dem_two_party_vote_percent = pres_dem_two_party_vote_percent,
+    income_per_capita               = income_per_capita,
+    prcntOld                        = prcntOld,
+    percent_ba_higher               = percent_ba_higher,
+    prcntWhite                      = prcntWhite,
+    blackpct                        = blackpct,
+    prcntHisp                       = prcntHisp,
+    people_per_mi2                  = people_per_mi2,
+    will_def_perc                   = will_def_perc,
+    will_prob_perc                  = will_prob_perc,
+    unsure_perc                     = unsure_perc,
+    not_prob_perc                   = not_prob_perc,
+    not_def_perc                    = not_def_perc
+  ) %>%
+  generate_predictor(
+    time_window = seq(as.Date("2021-04-19"), treatment_date, 1),
+    cases       = mean(cases),
+    deaths      = mean(deaths)
+  ) %>%
+  generate_weights(
+    optimization_window = seq(as.Date("2021-04-19"), treatment_date, 1),
+    optimization_method = "All",
+    margin_ipop         = 0.02,
+    sigf_ipop           = 7,
+    bound_ipop          = 6
+  ) %>%
+  generate_control()
+
+freq_trends_plot      = state_vaccines_out %>% plot_trends() + labs(caption = paste("State:", i))
+freq_differences_plot = state_vaccines_out %>% plot_differences()
+freq_weights_plot     = state_vaccines_out %>% plot_weights() + labs(caption = paste("State:", i))
+freq_balance_table    = state_vaccines_out %>% grab_balance_table()
+freq_placebos_plot    = state_vaccines_out %>% plot_placebos()
+
+print(freq_trends_plot)
+
+synth_data = state_vaccines_out %>% grab_synthetic_control()
+post_data_freq = synth_data[synth_data$time_unit >= treatment_date, ]
+freq_tadd = mean(post_data_freq$real_y - post_data_freq$synth_y)
+
+cat("Frequentist TADD:", round(freq_tadd, 4), "\n")
+
+```
+
+## IV. Bayesian Inference
+
+The Bayesian synthetic control method replaces the frequentist point-estimate framework with a fully probabilistic one. Instead of finding a single set of donor weights that minimizes a loss function, we place **priors** on the weights and learn a **posterior distribution** over them given the pre-treatment data. This gives us genuine uncertainty quantification — at every post-treatment time point, we get a distribution over the counterfactual, not just a single predicted value.
+
+The key question the model answers is: *"Given what Ohio looked like before the lottery, and given what the donor states looked like both before and after, what would Ohio's vaccination rate have looked like had there been no lottery?"* The difference between that counterfactual and the observed Ohio trajectory is the estimated treatment effect.
+
+### a. Dataset Formatting
+
+We split the data into pre- and post-treatment periods: the pre-treatment donor trajectories are used to learn the counterfactual weights, and the post-treatment donor trajectories are used to project the synthetic Ohio counterfactual.
+
+```{r,echo=FALSE, warning=FALSE, cache=TRUE}
+
+# =============================================================================
+# DATA PREPARATION FOR BAYESIAN MODEL
+# =============================================================================
+
+# Split the full dataset into pre- and post-treatment periods.
+# The treatment date (Ohio lottery announcement) is the dividing line.
+# Pre-treatment data is used to FIT the model (learn donor weights).
+# Post-treatment data is used to PREDICT the counterfactual Ohio trajectory.
+pre_data  = x[x$date <  treatment_date, ]
+post_data = x[x$date >= treatment_date, ]
+
+# All states except Ohio serve as "donors" — potential building blocks
+# for constructing a synthetic control that mimics pre-treatment Ohio.
+all_donors = setdiff(unique(x$state), "OH")
+
+# Extract Ohio's observed vaccination rates in each period.
+# ohio_pre  → the outcome we use to train the model
+# ohio_post → the outcome we compare against our counterfactual prediction
+ohio_pre  = pre_data$Administered_Dose1_Recip_18PlusPop_Pct[pre_data$state == "OH"]
+ohio_post = post_data$Administered_Dose1_Recip_18PlusPop_Pct[post_data$state == "OH"]
+
+# Build matrices of donor vaccination rates in each period.
+# donor_pre  → an (N_train × p) matrix: rows = time points, cols = donor states
+# donor_post → an (N_test  × p) matrix: same structure, post-treatment period
+# These become the design matrices X_train and X_test in the Stan model.
+donor_pre = sapply(all_donors, function(s) {
+  pre_data$Administered_Dose1_Recip_18PlusPop_Pct[pre_data$state == s]
+})
+
+donor_post = sapply(all_donors, function(s) {
+  post_data$Administered_Dose1_Recip_18PlusPop_Pct[post_data$state == s]
+})
+
+# Define the covariates used to enforce balance between Ohio and its donors.
+# These are structural characteristics of each state — demographics, political
+# lean, vaccine hesitancy — that should be similar between Ohio and its
+# synthetic control. Including them in the model adds a regularization term
+# that pulls the donor weights toward states that structurally resemble Ohio,
+# beyond just matching the pre-treatment outcome trajectory.
+covariate_names = c(
+  "pres_dem_two_party_vote_percent",
+  "income_per_capita",
+  "prcntOld",
+  "percent_ba_higher",
+  "prcntWhite",
+  "blackpct",
+  "prcntHisp",
+  "people_per_mi2",
+  "will_def_perc",
+  "will_prob_perc",
+  "unsure_perc",
+  "not_prob_perc",
+  "not_def_perc"
+)
+
+# Take a snapshot of covariate values at the treatment date for each state.
+covariate_snapshot = x[x$date == treatment_date, ]
+
+ohio_cov = as.numeric(covariate_snapshot[covariate_snapshot$state == "OH", covariate_names])
+
+donor_cov = sapply(all_donors, function(s) {
+  as.numeric(covariate_snapshot[covariate_snapshot$state == s, covariate_names])
+})
+
+# Standardize (z-score) all covariates before passing them to Stan.
+# This is important for two reasons:
+# 1. Covariates are on very different scales (e.g., income_per_capita in
+#    thousands vs. prcntWhite as a proportion) — without standardization,
+#    high-magnitude variables would dominate the covariate balance term.
+# 2. Standardized inputs make prior specification more principled — a
+#    Normal(0,1) prior on a standardized covariate has a clear interpretation.
+all_cov_matrix = cbind(ohio_cov, donor_cov)
+cov_means = rowMeans(all_cov_matrix)
+cov_sds   = apply(all_cov_matrix, 1, sd)
+
+ohio_cov_z  = (ohio_cov - cov_means) / cov_sds
+donor_cov_z = (donor_cov - cov_means) / cov_sds
+
+
+```
+
+### b. Bayesian Model Specification
+
+The core of our Bayesian synthetic control is a **linear regression with a Horseshoe prior** on the donor weights. The model has two components working together:
+
+**Outcome model:** Ohio's pre-treatment vaccination rate is modeled as a weighted combination of donor states' rates plus an intercept. In matrix form: $y_{\text{train}} \sim \mathcal{N}(\beta_0 + X_{\text{train}} \beta,\ \sigma^2)$, where $\beta \in \mathbb{R}^p$ are the donor weights we want to learn.
+
+**Covariate balance term:** We add a second likelihood term that penalizes weights which produce a synthetic control with covariate profiles different from Ohio's. This encodes the intuition that a good synthetic control should resemble Ohio not just in its outcome trajectory, but also in its structural characteristics (demographics, political lean, vaccine hesitancy). Formally: $z_{\text{treated}} \sim \mathcal{N}(Z_{\text{donors}} \beta,\ 1/\sqrt{\lambda_{\text{cov}}})$, where `covariate_weight` $\lambda_{\text{cov}}$ controls how strongly we enforce this balance.
+
+**Why the Horseshoe prior?** With 31 donor states, we expect only a few to be truly informative for constructing synthetic Ohio — most should get near-zero weight. The Horseshoe prior is designed exactly for this *sparse signal* setting. It uses a **global shrinkage parameter** $\tau$ that pulls all weights toward zero, and **local shrinkage parameters** $\lambda_j$ that allow individual donor weights to escape shrinkage if the data strongly support them. This is more flexible than Lasso (which can over-shrink large signals) and more principled than Ridge (which shrinks everything equally regardless of relevance).
+
+```{r,echo=TRUE, results='hide', warning=FALSE, cache=TRUE}
+# =============================================================================
+# BAYESIAN SYNTHETIC CONTROL: HORSESHOE PRIOR + COVARIATES
+# =============================================================================
+
+stan_code_full_cov = "
+data {
+  // Dimensions
+  int<lower=1> N_train;       // Number of pre-treatment time points
+  int<lower=1> N_test;        // Number of post-treatment time points
+  int<lower=1> p;             // Number of donor states
+  int<lower=1> K;             // Number of covariates
+
+  // Outcome data
+  vector[N_train] y_train;    // Ohio pre-treatment vaccination rates
+  matrix[N_train, p] X_train; // Donor pre-treatment rates (design matrix)
+  matrix[N_test, p]  X_test;  // Donor post-treatment rates (for prediction)
+
+  // Covariate balance data (standardized)
+  vector[K] z_treated;        // Ohio's standardized covariate vector
+  matrix[K, p] Z_donors;      // Donor states' standardized covariate matrix
+
+  // Strength of covariate balance enforcement:
+  // Higher values → synthetic control must match Ohio's covariates more closely
+  real<lower=0> covariate_weight;
+}
+parameters {
+  real beta_0;                               // Intercept
+  real<lower=0> sigma2;                      // Variance of the outcome model
+  vector[p] beta_raw;                        // Raw (unscaled) donor weights
+  vector<lower=0, upper=pi()/2>[p] lambda_unif; // Uniform auxiliary for local scales
+  real<lower=0> tau;                         // Global shrinkage: pulls ALL weights toward 0
+}
+transformed parameters {
+  vector[p] beta;             // Final donor weights (after Horseshoe scaling)
+  real<lower=0> sigma;        // Standard deviation (sqrt of sigma2)
+  vector<lower=0>[p] lambda;  // Local shrinkage scales — one per donor state
+  vector[N_train] X_beta;     // Fitted values in the pre-treatment period
+
+  // Horseshoe reparameterization using the half-Cauchy via arctangent trick:
+  // lambda_unif ~ Uniform(0, pi/2) → lambda = tau * tan(lambda_unif)
+  // This is equivalent to lambda_j ~ Half-Cauchy(0, tau), but more numerically
+  // stable for HMC. Each beta[j] = lambda[j] * beta_raw[j].
+  // Interpretation: donors with large lambda[j] can have large weights;
+  // those with small lambda[j] are shrunk toward zero by tau.
+  lambda = tau * tan(lambda_unif);
+  for (j in 1:p) {
+    beta[j] = lambda[j] * beta_raw[j];
+  }
+  sigma = sqrt(sigma2);
+  X_beta = beta_0 + X_train * beta;
+}
+model {
+  // --- Priors ---
+
+  // beta_raw ~ N(0,1): standard normal on raw weights before Horseshoe scaling.
+  // The actual scale of beta[j] is determined by lambda[j], not beta_raw[j].
+  beta_raw ~ normal(0, 1);
+
+  // tau ~ Half-Cauchy(0, sigma): global shrinkage scale, data-adaptive.
+  // Anchored to sigma so the amount of shrinkage scales with outcome variability.
+  // If sigma is large (noisy data), tau is allowed to be large too.
+  tau      ~ cauchy(0, sigma);
+
+  // Weakly informative priors on sigma and intercept.
+  // Cauchy(0,10) is heavy-tailed — allows large values if the data support them
+  // but regularizes toward zero. Appropriate when we have little prior knowledge
+  // about the scale of the vaccination rate or the intercept.
+  sigma    ~ cauchy(0, 10);
+  beta_0   ~ cauchy(0, 10);
+
+  // --- Likelihood 1: Outcome model ---
+  // Ohio's pre-treatment vaccination rates are modeled as a linear combination
+  // of donor rates, weighted by beta, plus Gaussian noise.
+  y_train ~ normal(X_beta, sigma);
+
+  // --- Likelihood 2: Covariate balance term ---
+  // We want Z_donors * beta ≈ z_treated, i.e., the weighted combination of
+  // donor covariates should match Ohio's standardized covariate vector.
+  // This acts as a soft constraint: covariate_weight controls its strength.
+  // Think of it as adding a prior that says 'prefer weights that produce a
+  // demographically similar synthetic Ohio.'
+  z_treated ~ normal(Z_donors * beta, 1.0 / sqrt(covariate_weight));
+}
+generated quantities {
+  // Post-treatment counterfactual: apply the learned donor weights to the
+  // donors' post-treatment trajectories to predict what Ohio WOULD have looked
+  // like without the lottery. The difference between this and actual Ohio
+  // is our estimated treatment effect at each time point.
+  vector[N_test] y_test_pred;
+  for (i in 1:N_test) {
+    y_test_pred[i] = beta_0 + X_test[i,] * beta;
+  }
+}
+"
+
+# Pass all required data to Stan.
+# covariate_weight = 1.0 means moderate enforcement of covariate balance.
+# Increasing this forces stricter demographic matching at the cost of outcome fit.
+stan_data_full = list(
+  N_train          = length(ohio_pre),
+  N_test           = nrow(donor_post),
+  p                = length(all_donors),
+  K                = length(covariate_names),
+  y_train          = ohio_pre,
+  X_train          = donor_pre,
+  X_test           = donor_post,
+  z_treated        = ohio_cov_z,
+  Z_donors         = donor_cov_z,
+  covariate_weight = 1.0
+)
+
+# Run MCMC via Stan's HMC/NUTS sampler.
+# iter = 4000 total per chain, warmup = 2000 discarded for adaptation.
+# We retain 2000 posterior draws × 4 chains = 8000 total posterior samples.
+# adapt_delta = 0.99: accept smaller HMC step sizes → fewer divergent transitions.
+#   This is especially important for the Horseshoe, whose posterior has a
+#   challenging funnel geometry near tau ≈ 0.
+# max_treedepth = 15: allows NUTS to build deeper trajectory trees for complex
+#   posteriors — at the cost of more computation per iteration.
+fit_full = stan(
+  model_code = stan_code_full_cov,
+  data       = stan_data_full,
+  iter       = 4000,
+  warmup     = 2000,
+  chains     = 4,
+  seed       = 42,
+  control    = list(adapt_delta = 0.99, max_treedepth = 15)
+)
+
+
+```
+
+### c. Posterior Inference
+
+After sampling, we have 8,000 posterior draws of every parameter — each draw is a complete, jointly plausible set of donor weights, intercept, and noise level. We summarize these draws to compute the **TADD (Time-Averaged Daily Difference)**, giving us a full posterior distribution over the average treatment effect rather than a single point estimate.
+
+```{r,echo=FALSE, warning=FALSE, cache=TRUE}
+# =============================================================================
+# POSTERIOR EXTRACTION AND TADD CALCULATION
+# =============================================================================
+
+# Extract posterior draws for each parameter.
+# Each of these is a matrix/vector where rows = posterior draws (8000),
+# cols = parameter dimensions (e.g., beta has p columns, one per donor).
+beta_draws   = rstan::extract(fit_full, pars = "beta")$beta       # (8000 × p) donor weights
+beta_0_draws = rstan::extract(fit_full, pars = "beta_0")$beta_0   # (8000,)    intercepts
+sigma_draws  = rstan::extract(fit_full, pars = "sigma")$sigma     # (8000,)    noise SDs
+y_test_draws = rstan::extract(fit_full, pars = "y_test_pred")$y_test_pred  # (8000 × N_test) counterfactuals
+
+# Reconstruct the full pre-treatment fitted trajectory for each posterior draw.
+# x_beta_pre: for each draw, multiply donor weights by pre-treatment donor matrix
+# y_fit_draws: add the intercept (beta_0) to get the full fitted pre-treatment curve
+# y_all_draws: concatenate pre- and post-treatment draws into one full trajectory
+# This gives us a posterior distribution over the ENTIRE synthetic Ohio trajectory.
+x_beta_pre  = beta_draws %*% t(donor_pre)         # (8000 × N_train)
+y_fit_draws = sweep(x_beta_pre, 1, beta_0_draws, FUN = "+")  # add intercept per draw
+y_all_draws = cbind(y_fit_draws, y_test_draws)     # (8000 × (N_train + N_test))
+
+# Compute the TADD (Time-Averaged Daily Difference) for each posterior draw.
+# For each draw: compute (actual Ohio - synthetic Ohio) at each post-treatment
+# time point, then average across time. This gives one TADD value per draw.
+# The result is a vector of 8000 TADD values — a full posterior distribution
+# over the average treatment effect.
+tadd_draws = rowMeans(sweep(y_test_draws, 2, ohio_post,
+                             FUN = function(synth, actual) actual - synth))
+
+# Summarize the posterior distribution of TADD:
+# - Posterior mean: our best single-number estimate of the lottery effect
+# - 95% credible interval: the range that contains 95% of posterior probability.
+#   Interpretation: "given the data and model, there is a 95% probability that
+#   the true TADD lies in this interval." This is more intuitive than a
+#   frequentist confidence interval, which does NOT have this interpretation.
+# - P(TADD > 0): the posterior probability that the lottery had a positive effect.
+#   This is a direct probability statement — something frequentist p-values
+#   cannot provide.
+tadd_mean  = mean(tadd_draws)
+tadd_lo    = quantile(tadd_draws, 0.025)
+tadd_hi    = quantile(tadd_draws, 0.975)
+p_positive = mean(tadd_draws > 0)
+
+cat("Bayesian TADD (posterior mean):", round(tadd_mean, 4), "\n")
+cat("95% credible interval: [", round(tadd_lo, 4), ", ", round(tadd_hi, 4), "]\n", sep = "")
+cat("P(TADD > 0):", round(p_positive, 4), "\n")
+```
+
+### d. MCMC Diagnostics
+
+Before interpreting any posterior summaries, we verify that the sampler converged. We check four diagnostics: **R-hat** (between-chain vs. within-chain variance; should be $\approx 1$), **ESS** (effective independent draws after accounting for autocorrelation), **divergent transitions** (HMC integration failures in high-curvature regions), and **treedepth saturation** (NUTS hitting its trajectory limit).
+
+```{r,echo=FALSE, warning=FALSE, cache=TRUE}
+# =============================================================================
+# MCMC DIAGNOSTICS
+# =============================================================================
+
+# Total posterior draws = (iter - warmup) × chains = 2000 × 4 = 8000
+total_draws = 8000
+
+# --- R-hat diagnostics ---
+# R-hat compares within-chain and between-chain variance.
+# R-hat ≈ 1.00 → chains converged to the same distribution (good)
+# R-hat > 1.01 → borderline; chains may not have fully mixed
+# R-hat > 1.05 → clear convergence failure; do not trust posteriors
+rhat_values   = summary(fit_full)$summary[, "Rhat"]
+rhat_max      = max(rhat_values, na.rm = TRUE)
+rhat_over_101 = sum(rhat_values > 1.01, na.rm = TRUE)
+rhat_over_105 = sum(rhat_values > 1.05, na.rm = TRUE)
+
+# --- Effective Sample Size (ESS) diagnostics ---
+# ESS accounts for autocorrelation within chains.
+# A chain of 8000 correlated draws might only be equivalent to 400 independent ones.
+# ESS < 400 → unreliable posterior tail estimates (quantiles, credible intervals)
+# ESS > 1000 → generally safe for most summary statistics
+ess_values    = summary(fit_full)$summary[, "n_eff"]
+ess_min       = min(ess_values, na.rm = TRUE)
+ess_median    = median(ess_values, na.rm = TRUE)
+ess_under_400 = sum(ess_values < 400, na.rm = TRUE)
+
+# --- Divergent transitions and treedepth ---
+# Divergences: HMC numerical integration errors in high-curvature regions.
+# Even 1% divergences can indicate the sampler missed parts of the posterior.
+# We set adapt_delta = 0.99 above to minimize these — checking here confirms it worked.
+# Treedepth hits: if NUTS consistently reaches max_treedepth = 15, the posterior
+# geometry may require even deeper trajectories (or better parameterization).
+sampler_params  = get_sampler_params(fit_full, inc_warmup = FALSE)
+divergent       = sum(sapply(sampler_params, function(x) sum(x[, "divergent__"])))
+treedepth_hits  = sum(sapply(sampler_params, function(x) sum(x[, "treedepth__"] >= 15)))
+
+# Compile all diagnostics into a summary table with thresholds and pass/fail status.
+diagnostics_table = data.frame(
+  Diagnostic = c(
+    "R-hat (max)",
+    "R-hat > 1.01 (count)",
+    "R-hat > 1.05 (count)",
+    "ESS (minimum)",
+    "ESS (median)",
+    "ESS < 400 (count)",
+    "Divergent transitions",
+    "Treedepth saturation (max = 15)"
+  ),
+  Value = c(
+    sprintf("%.3f", rhat_max),
+    rhat_over_101,
+    rhat_over_105,
+    round(ess_min, 0),
+    round(ess_median, 0),
+    ess_under_400,
+    sprintf("%d / %d (%.1f%%)", divergent, total_draws, 100 * divergent / total_draws),
+    sprintf("%d / %d (%.1f%%)", treedepth_hits, total_draws, 100 * treedepth_hits / total_draws)
+  ),
+  Threshold = c("< 1.01", "= 0", "= 0", "> 400", "> 1000", "= 0", "< 1%", "< 5%"),
+  Status = c(
+    ifelse(rhat_max < 1.01, "Pass", ifelse(rhat_max < 1.05, "Borderline", "Fail")),
+    ifelse(rhat_over_101 == 0, "Pass", "Borderline"),
+    ifelse(rhat_over_105 == 0, "Pass", "Fail"),
+    ifelse(ess_min > 400, "Pass", ifelse(ess_min > 200, "Borderline", "Fail")),
+    ifelse(ess_median > 1000, "Pass", "Borderline"),
+    ifelse(ess_under_400 == 0, "Pass", "Borderline"),
+    ifelse(divergent == 0, "Pass",
+           ifelse(divergent / total_draws < 0.01, "Borderline", "Fail")),
+    ifelse(treedepth_hits / total_draws < 0.05, "Pass", "Inefficient")
+  ),
+  stringsAsFactors = FALSE
+)
+
+print(diagnostics_table, row.names = FALSE)
+
+# Visual convergence checks:
+# Traceplot: each chain's parameter value over iterations.
+#   Good mixing looks like a "hairy caterpillar" — all chains overlapping randomly.
+#   Trends or separation between chains indicate convergence problems.
+# Pairs plot: joint posterior of key parameters.
+#   Funnel shapes or strong correlations suggest the parameterization could be improved.
+traceplot(fit_full, pars = c("beta_0", "sigma", "tau", "beta[10]", "beta[30]"))
+pairs(fit_full, pars = c("tau", "sigma", "beta_0"))
+
+
+```
+
+## V. Results
+
+```{r,echo=FALSE, warning=FALSE, cache=TRUE}
+# =============================================================================
+# RESULTS COMPARISON TABLE
+# =============================================================================
+
+results_table = data.frame(
+  Model = c(
+    "Frequentist SCM",
+    "Bayesian (simple, 5 donors)",
+    "Bayesian (horseshoe, 31 donors, 13 covariates)"
+  ),
+  `Point Estimate (TADD)` = c("0.40", "0.31", "0.36"),
+  `95% Interval`          = c("-", "[-0.14, 0.77]", "[-0.37, 1.14]"),
+  Inference               = c("Placebo test",
+                              "P(effect > 0) = 90.4%",
+                              "P(effect > 0) = 83.4%"),
+  Advantages              = c("Simple, fast, standard",
+                              "Uncertainty quantification",
+                              "Full regularization + uncertainty"),
+  check.names = FALSE
+)
+
+print(results_table)
+
+```
+
+### a. Synthetic Ohio Trajectory and Actual Trajectory Comparison
+
+```{r,echo=FALSE, warning=FALSE, cache=TRUE}
+# =============================================================================
+# PLOT 1: ACTUAL VS SYNTHETIC OHIO TRAJECTORY
+# =============================================================================
+
+all_dates = c(
+  unique(pre_data$date[pre_data$state == "OH"]),
+  unique(post_data$date[post_data$state == "OH"])
+)
+
+synth_summary = data.frame(
+  date        = all_dates,
+  synth_mean  = apply(y_all_draws, 2, mean),
+  synth_lower = apply(y_all_draws, 2, quantile, 0.025),
+  synth_upper = apply(y_all_draws, 2, quantile, 0.975),
+  actual      = c(ohio_pre, ohio_post)
+)
+
+plot_trajectory = ggplot(synth_summary, aes(x = date)) +
+  geom_ribbon(aes(ymin = synth_lower, ymax = synth_upper),
+              fill = red, alpha = 0.2) +
+  geom_line(aes(y = synth_mean, color = "Synthetic Ohio"),
+            linewidth = 1, linetype = "dashed") +
+  geom_line(aes(y = actual, color = "Actual Ohio"),
+            linewidth = 1) +
+  geom_vline(xintercept = as.numeric(treatment_date),
+             linetype = "dotted", color = "black") +
+  scale_color_manual(values = c("Actual Ohio" = navy, "Synthetic Ohio" = red)) +
+  labs(
+    x        = NULL,
+    y        = "First-dose vaccination rate (% of 18+)",
+    color    = NULL,
+    title    = "Actual vs. Synthetic Ohio",
+    subtitle = "Shaded band = 95% posterior credible interval; dotted line = May 12, 2021"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(legend.position  = "bottom",
+        panel.grid.minor = element_blank())
+
+print(plot_trajectory)
+```
+
+### b. Daily Treatment Effect with Uncertainty
+
+```{r,echo=FALSE, warning=FALSE, cache=TRUE}
+# =============================================================================
+# PLOT 2: DAILY TREATMENT EFFECT WITH UNCERTAINTY
+# =============================================================================
+
+effect_draws = sweep(y_test_draws, 2, ohio_post,
+                      FUN = function(synth, actual) actual - synth)
+
+post_dates = unique(post_data$date[post_data$state == "OH"])
+
+effect_summary = data.frame(
+  date         = post_dates,
+  effect_mean  = apply(effect_draws, 2, mean),
+  effect_lower = apply(effect_draws, 2, quantile, 0.025),
+  effect_upper = apply(effect_draws, 2, quantile, 0.975)
+)
+
+plot_daily_effect = ggplot(effect_summary, aes(x = date)) +
+  geom_ribbon(aes(ymin = effect_lower, ymax = effect_upper),
+              fill = red, alpha = 0.2) +
+  geom_line(aes(y = effect_mean), color = red, linewidth = 1) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "gray30") +
+  labs(
+    x        = NULL,
+    y        = "Estimated lottery effect (pp)",
+    title    = "Daily Estimated Lottery Effect Over Post-Treatment Period",
+    subtitle = "Actual Ohio - Synthetic Ohio, with 95% posterior credible interval"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(panel.grid.minor = element_blank())
+
+print(plot_daily_effect)
+```
+
+### c. Posterior Distribution of TADD
+
+```{r,echo=FALSE, warning=FALSE, cache=TRUE}
+# =============================================================================
+# PLOT 3: POSTERIOR DISTRIBUTION OF TADD
+# =============================================================================
+
+tadd_df = data.frame(tadd = tadd_draws)
+
+plot_tadd_posterior = ggplot(tadd_df, aes(x = tadd)) +
+  geom_density(fill = red, alpha = 0.3, color = red, linewidth = 1) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "gray30") +
+  geom_vline(xintercept = tadd_mean, color = navy, linewidth = 1) +
+  geom_vline(xintercept = c(tadd_lo, tadd_hi), color = navy, linetype = "dotted") +
+  annotate("text", x = tadd_mean, y = 0,
+           label = sprintf("Posterior mean\n= %.3f", tadd_mean),
+           vjust = -0.5, hjust = -0.1, size = 3.5, color = navy) +
+  annotate("text", x = max(tadd_draws), y = Inf,
+           label = sprintf("P(effect > 0) = %.1f%%", 100 * p_positive),
+           vjust = 2, hjust = 1, size = 4, fontface = "bold", color = red) +
+  labs(
+    x        = "Time-Averaged Daily Difference (pp)",
+    y        = "Posterior density",
+    title    = "Posterior Distribution of Ohio Vax-a-Million Lottery Effect",
+    subtitle = sprintf("95%% credible interval: [%.3f, %.3f]", tadd_lo, tadd_hi)
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(panel.grid.minor = element_blank())
+
+print(plot_tadd_posterior)
+```
+
+### d. Posterior Donor Weights
+
+```{r,echo=FALSE, warning=FALSE, cache=TRUE}
+# =============================================================================
+# PLOT 4: POSTERIOR DONOR WEIGHTS
+# =============================================================================
+
+weight_summary = data.frame(
+  donor = all_donors,
+  mean  = apply(beta_draws, 2, mean),
+  lower = apply(beta_draws, 2, quantile, 0.025),
+  upper = apply(beta_draws, 2, quantile, 0.975)
+)
+
+weight_summary = weight_summary[order(weight_summary$mean, decreasing = TRUE), ]
+weight_summary$donor = factor(weight_summary$donor, levels = weight_summary$donor)
+
+plot_weights = ggplot(weight_summary, aes(x = donor, y = mean)) +
+  geom_col(fill = navy, alpha = 0.7) +
+  geom_errorbar(aes(ymin = lower, ymax = upper), width = 0.3, color = red) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "gray30") +
+  labs(
+    x        = NULL,
+    y        = "Weight (beta)",
+    title    = "Posterior Weights on Donor States",
+    subtitle = "Error bars show 95% credible intervals"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(
+    axis.text.x      = element_text(angle = 45, hjust = 1),
+    panel.grid.minor = element_blank()
+  )
+
+print(plot_weights)
+```
+
+### e. Comparing Frequentist Vs Bayesian Results
+
+```{r,echo=FALSE, warning=FALSE, cache=TRUE}
+# =============================================================================
+# PLOT 5: FREQUENTIST VS BAYESIAN COMPARISON
+# =============================================================================
+
+comparison_df = data.frame(
+  method = c("Frequentist SCM", "Bayesian SCM"),
+  tadd   = c(freq_tadd, tadd_mean),
+  lower  = c(NA, tadd_lo),
+  upper  = c(NA, tadd_hi)
+)
+
+plot_comparison = ggplot(comparison_df, aes(x = method, y = tadd, color = method)) +
+  geom_point(size = 4) +
+  geom_errorbar(aes(ymin = lower, ymax = upper), width = 0.15, linewidth = 1) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "gray30") +
+  scale_color_manual(values = c("Frequentist SCM" = navy, "Bayesian SCM" = red),
+                     guide  = "none") +
+  labs(
+    x        = NULL,
+    y        = "TADD (pp)",
+    title    = "Estimated Lottery Effect: Frequentist vs Bayesian",
+    subtitle = "Bayesian error bars = 95% credible interval"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(panel.grid.minor = element_blank())
+
+print(plot_comparison)
+
+```
